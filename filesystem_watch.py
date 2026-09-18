@@ -1,6 +1,7 @@
 import hashlib
 import os
 import threading
+from collections import defaultdict
 
 
 def hash_file(path, size_cap_bytes=100_000_000):
@@ -50,3 +51,25 @@ class DebouncedHasher:
             self._timers.pop(path, None)
         digest = hash_file(path, self.size_cap_bytes)
         self.on_settled(path, digest)
+
+
+_MASS_CHANGE_THRESHOLD = 3
+
+
+class RenameExtensionTracker:
+    def __init__(self, on_ransomware_pattern):
+        self.on_ransomware_pattern = on_ransomware_pattern
+        self._counts = defaultdict(int)
+        self._fired = set()
+
+    def record_rename(self, old_path, new_path):
+        old_ext = os.path.splitext(old_path)[1].lower()
+        new_ext = os.path.splitext(new_path)[1].lower()
+        if new_ext == old_ext or new_ext == "":
+            return
+
+        key = (old_ext, new_ext)
+        self._counts[key] += 1
+        if self._counts[key] >= _MASS_CHANGE_THRESHOLD and key not in self._fired:
+            self._fired.add(key)
+            self.on_ransomware_pattern(old_ext, new_ext, self._counts[key])
