@@ -25,6 +25,22 @@ def _hash_image(path):
     return digest
 
 
+def _creation_event_to_evidence(wmi_event):
+    image_path = getattr(wmi_event, "ExecutablePath", None)
+    return {
+        "pid": wmi_event.ProcessId,
+        "ppid": wmi_event.ParentProcessId,
+        "name": wmi_event.Name,
+        "cmdline": wmi_event.CommandLine,
+        "image_path": image_path,
+        "image_sha256": _hash_image(image_path) if image_path else None,
+    }
+
+
+def _deletion_event_to_evidence(wmi_event):
+    return {"pid": wmi_event.ProcessId, "name": wmi_event.Name}
+
+
 class ProcessMonitor:
     def __init__(self, root_pid, emit_func, poll_interval=1):
         self.root_pid = root_pid
