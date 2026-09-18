@@ -303,18 +303,19 @@ def main():
     registry_watcher.stop()
     diff_registry(reg_before, reg_after, emit, ROOTPID)
 
-    for hive, path in triggered_roots:
+    for hive, path in sorted(triggered_roots):
         emit(
-            category="registry_behavior",
+            category="ghostrun_status",
             event="uncataloged_registry_change",
             confidence="low",
             data={
-                "pid": ROOTPID,
                 "hive": hive,
                 "path": path,
                 "note": (
-                    "A change occurred under this broad root outside the "
-                    "curated persistence key list. Manual review recommended."
+                    "Registry activity observed under this broad root during "
+                    "the analysis window. This mechanism cannot attribute the "
+                    "change to a specific process; treat as informational "
+                    "context, not a sample-attributed finding."
                 ),
             },
         )
