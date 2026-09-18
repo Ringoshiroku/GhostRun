@@ -9,7 +9,7 @@ import os
 import queue
 from datetime import datetime, timezone
 from sender_http import PutEvidenceSender
-from network_watch import NetworkCapture
+from network_watch import NetworkCapture, CAPTURE_ACTIVITY_EVENTS
 from process_mon import ProcessMonitor
 from registry_snapshot import snapshot_registry, diff_registry
 from registry_watch import RegistryWatcher
@@ -84,7 +84,10 @@ def emit(category, event, data, **meta):
     if network_infer:
         network_infer.ingest(category, event, data)
 
-    if category == "network_behavior" and event != "capture_unavailable":
+    # allowlist of real capture activity, not a denylist of degradation notices
+    # this also excludes capture_failed and this engine's own derived
+    # malware_network_activity output, not just capture_unavailable
+    if category == "network_behavior" and event in CAPTURE_ACTIVITY_EVENTS:
         NETWORK_EVENT_COUNT += 1
 
     if not SENDER:
@@ -247,6 +250,8 @@ def main():
         eve_log_dir=os.path.dirname(args.file),
         emit_func=emit,
         sslkeylogfile_path=sslkeylogfile_path,
+        exclude_host=args.host,
+        exclude_port=args.port,
     )
     net_capture.start()
 
@@ -366,8 +371,11 @@ def main():
     static_net.analyze(emit)
     network_finding.analyze(emit)
     
-    # Anti-analysis evidence (derived, emitted after all monitors stopped)
-    if NETWORK_EVENT_COUNT == 0:
+    # anti-analysis evidence, derived and emitted after all monitors stop
+    # also gated on tools_available: if dumpcap/suricata were never installed,
+    # a zero event count means capture never ran, not that the sample avoided
+    # the network, so this heuristic must not fire
+    if NETWORK_EVENT_COUNT == 0 and net_capture.tools_available:
         emit(
             category="behavior",
             event="no_network_activity_after_execution",
