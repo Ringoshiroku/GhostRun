@@ -58,11 +58,8 @@ class TimelineBuilder:
 
             if category == "filesystem_behavior":
                 if event == "file_created":
-                    for path in data.get("examples", []):
-                        if not path:
-                            continue
-                        if self.is_system_noise(path):
-                            continue
+                    path = data.get("path")
+                    if path and not self.is_system_noise(path):
                         if path.lower().endswith((".exe", ".dll", ".ps1")):
                             self.iocs["file"].add(path)
 
@@ -82,9 +79,8 @@ class TimelineBuilder:
 
             # ---- Ransom note (Soft IOC)
             if category == "filesystem_behavior" and event == "file_created":
-                for p in data.get("examples", []):
-                    if not p:
-                        continue
+                p = data.get("path")
+                if p:
                     fname = os.path.basename(p).lower()
                     if "read" in fname or "decrypt" in fname or "recover" in fname:
                         self.iocs["Ransom Note"].add(p)

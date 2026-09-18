@@ -317,13 +317,13 @@ class MarkdownReportBuilder:
             data = ev.get("data", {})
 
             if evt == "file_created":
-                fs_summary["created"] += data.get("count", 0)
+                fs_summary["created"] += 1
 
             elif evt == "file_deleted":
-                fs_summary["deleted"] += data.get("count", 0)
+                fs_summary["deleted"] += 1
 
             elif evt == "file_modified":
-                fs_summary["modified"] += data.get("count", 0)
+                fs_summary["modified"] += 1
 
             elif evt == "mass_extension_change":
                 fs_summary["ext_changes"].append({
@@ -460,16 +460,16 @@ class MarkdownReportBuilder:
                     self.hard_iocs["Ransomware Extension"].add(data.get("to_ext"))
 
                 if evt == "file_created":
-                    for p in data.get("examples", []):
+                    p = data.get("path")
+                    if p:
                         if is_noise(p):
                             self.environmental.add(p)
-                            continue
+                        else:
+                            if p.lower().endswith((".exe", ".dll", ".ps1")):
+                                self.soft_iocs["Dropped File"].add(p)
 
-                        if p.lower().endswith((".exe", ".dll", ".ps1")):
-                            self.soft_iocs["Dropped File"].add(p)
-
-                        if "read" in p.lower():
-                            self.soft_iocs["Ransom Note"].add(p)
+                            if "read" in p.lower():
+                                self.soft_iocs["Ransom Note"].add(p)
 
             ## registry
             if cat in ("registry_behavior", "registry_raw"):
