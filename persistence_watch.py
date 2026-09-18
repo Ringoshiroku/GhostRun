@@ -76,15 +76,46 @@ class PersistenceWatcher:
         self.emit("persistence", "wmi_event_subscription_created", evidence)
 
     def run(self):
-        conn = _connect_subscription_namespace()
-        watchers = {
-            class_name: getattr(conn, class_name).watch_for("creation")
-            for class_name in _WATCHED_CLASSES
-        }
+        # pywin32/wmi needs COM initialized on any thread before its
+        # first COM call (wmi.WMI() does this under the hood).
+        # pywin32 only auto-initializes COM for the main thread at
+        # import time, not for threads created later (this runs on a
+        # worker thread started by ghostrun.py), so without this,
+        # wmi.WMI() raises a com_error and this thread dies before
+        # doing anything. same fix as process_mon.py's
+        # ProcessMonitor.run().
+        pythoncom = None
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except ImportError:
+            # pythoncom (part of pywin32) isn't installed on this platform
+            # (e.g. this non-windows dev/test host). nothing to initialize.
+            pythoncom = None
 
-        while self.running:
-            for class_name, watcher in watchers.items():
-                self._poll_class(watcher, class_name)
+        try:
+            try:
+                conn = _connect_subscription_namespace()
+                watchers = {
+                    class_name: getattr(conn, class_name).watch_for("creation")
+                    for class_name in _WATCHED_CLASSES
+                }
+
+                while self.running:
+                    for class_name, watcher in watchers.items():
+                        self._poll_class(watcher, class_name)
+            except wmi.x_wmi as exc:
+                # covers COM errors, RPC failures, or WMI provider restarts
+                # beyond a plain timeout (already handled inside _poll_class).
+                # record the degradation via ghostrun_status (exempt from
+                # emit()'s pid filter, so it's actually recorded) instead of
+                # letting the thread die silently with no evidence trail.
+                self.emit("ghostrun_status", "persistence_watcher_degraded", {
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+        finally:
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
 
     def stop(self):
         self.running = False
