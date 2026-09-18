@@ -72,6 +72,7 @@ class PersistenceDetector:
                         "process:process_create",
                     ],
                     data={
+                        "pid": ref.get("pid"),
                         "path": ref.get("path"),
                         "location": location,
                         "note": "Executable referenced in registry was executed during analysis window.",
@@ -88,6 +89,7 @@ class PersistenceDetector:
                         "registry_behavior:execution_reference_detected",
                     ],
                     data={
+                        "pid": ref.get("pid"),
                         "path": ref.get("path"),
                         "location": location,
                         "note": "Registry execution reference observed without corresponding process execution.",
