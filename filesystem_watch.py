@@ -85,8 +85,8 @@ class RenameExtensionTracker:
 
 
 class _Handler(FileSystemEventHandler):
-    def __init__(self, root_name, emit, hasher, rename_tracker, root_pid):
-        self.root_name = root_name
+    def __init__(self, watcher, emit, hasher, rename_tracker, root_pid):
+        self.watcher = watcher
         self.emit = emit
         self.hasher = hasher
         self.rename_tracker = rename_tracker
@@ -96,7 +96,7 @@ class _Handler(FileSystemEventHandler):
         if event.is_directory:
             return
         self.emit("filesystem_behavior", "file_created", {
-            "root": self.root_name, "path": event.src_path, "pid": self.root_pid,
+            "root": self.watcher._root_for_path(event.src_path), "path": event.src_path, "pid": self.root_pid,
         })
         self.hasher.touch(event.src_path)
 
@@ -110,14 +110,14 @@ class _Handler(FileSystemEventHandler):
             return
         self.hasher.cancel(event.src_path)
         self.emit("filesystem_behavior", "file_deleted", {
-            "root": self.root_name, "path": event.src_path, "pid": self.root_pid,
+            "root": self.watcher._root_for_path(event.src_path), "path": event.src_path, "pid": self.root_pid,
         })
 
     def on_moved(self, event):
         if event.is_directory:
             return
         self.emit("filesystem_behavior", "file_renamed", {
-            "root": self.root_name, "old_path": event.src_path, "new_path": event.dest_path,
+            "root": self.watcher._root_for_path(event.src_path), "old_path": event.src_path, "new_path": event.dest_path,
             "pid": self.root_pid,
         })
         self.rename_tracker.record_rename(event.src_path, event.dest_path)
@@ -137,11 +137,42 @@ class FilesystemWatcher:
         )
         self.rename_tracker = RenameExtensionTracker(on_ransomware_pattern=self._on_ransomware_pattern)
 
-        for root_name, root_path in targets.items():
-            if not root_path or not os.path.isdir(root_path):
+        handler = _Handler(self, self.emit, self.hasher, self.rename_tracker, self.root_pid)
+
+        # watchdog's recursive=True already covers everything under a
+        # scheduled target. a target nested inside another configured
+        # target (e.g. STARTUP inside APPDATA) would otherwise get its
+        # events delivered twice, once per matching schedule. so only
+        # schedule the outermost targets. self.targets still keeps every
+        # entry, nested ones included, so _root_for_path can attribute
+        # events to the most specific root.
+        valid = {
+            root_name: os.path.normpath(root_path)
+            for root_name, root_path in targets.items()
+            if root_path and os.path.isdir(root_path)
+        }
+        for root_name, norm_path in valid.items():
+            nested = any(
+                other_name != root_name and self._is_nested_under(norm_path, other_norm)
+                for other_name, other_norm in valid.items()
+            )
+            if nested:
                 continue
-            handler = _Handler(root_name, self.emit, self.hasher, self.rename_tracker, self.root_pid)
-            self._observer.schedule(handler, root_path, recursive=True)
+            self._observer.schedule(handler, targets[root_name], recursive=True)
+
+    @staticmethod
+    def _is_nested_under(inner_path, outer_path):
+        """true if inner_path is a proper subdirectory of outer_path
+        (case-insensitive match, same rule _root_for_path uses).
+        equal paths do not count as nested.
+        """
+        if os.path.normcase(inner_path) == os.path.normcase(outer_path):
+            return False
+        try:
+            common = os.path.commonpath([inner_path, outer_path])
+        except ValueError:
+            return False
+        return os.path.normcase(common) == os.path.normcase(outer_path)
 
     def _root_for_path(self, path):
         """
