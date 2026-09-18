@@ -16,7 +16,7 @@ from registry_watch import RegistryWatcher
 from persistence_detector import PersistenceDetector
 from detector_network_inference import NetworkInferenceDetector
 from detector_static_network import StaticNetworkIndicatorDetector
-from filesystem_snapshot import snapshot_filesystem_multi, diff_filesystem_multi
+from filesystem_watch import FilesystemWatcher
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
 import atexit
@@ -190,7 +190,9 @@ def main():
         "DESKTOP": os.path.join(
             os.environ.get("USERPROFILE"),
             "Desktop"
-        )        
+        ),
+        "PUBLIC": r"C:\Users\Public",
+        "WINDOWS_TEMP": r"C:\Windows\Temp",
     }
         
     # execute persistence detector
@@ -227,9 +229,6 @@ def main():
     registry_watcher = RegistryWatcher(on_change=_on_registry_root_changed)
     registry_watcher.start()
 
-    print("[GhostRun] Filesystem snapshot: BEFORE")
-    fs_before = snapshot_filesystem_multi(FS_TARGETS)
-    
     # -----------------------------------------------------
     # 3️⃣ Execute sample
     # -----------------------------------------------------
@@ -261,7 +260,11 @@ def main():
         daemon=True
     )
     sender_thread.start()
-    
+
+    # filesystem watcher
+    fs_watcher = FilesystemWatcher(targets=FS_TARGETS, emit_func=emit, root_pid=ROOTPID)
+    fs_watcher.start()
+
     # Process monitor
     proc_monitor = ProcessMonitor(
         root_pid=proc.pid,
@@ -320,9 +323,8 @@ def main():
             },
         )
 
-    print(f"[GhostRun] Filesystem snapshot (PID {ROOTPID}): AFTER")
-    fs_after = snapshot_filesystem_multi(FS_TARGETS)
-    diff_filesystem_multi(fs_before, fs_after, emit, ROOTPID)
+    print(f"[GhostRun] Filesystem watcher (PID {ROOTPID}): STOP")
+    fs_watcher.stop()
 
     # -----------------------------------------------------
     # 7️⃣ Stop monitors cleanly
