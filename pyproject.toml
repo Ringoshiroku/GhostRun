@@ -5,6 +5,7 @@ description = "GhostRun dynamic malware analysis engine"
 requires-python = ">=3.10"
 dependencies = [
     "psutil>=5.9",
+    "wmi",
 ]
 
 [project.optional-dependencies]
