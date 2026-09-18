@@ -3,9 +3,11 @@ import re
 
 if sys.platform == "win32":
     import winreg
+    _HIVE_MAP = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
 else:
     # stub for testing on non-Windows platforms
     winreg = None
+    _HIVE_MAP = {}
 
 # =========================================================
 # persistence monitoring
@@ -79,66 +81,111 @@ EXEC_PATTERN = re.compile(
 # SNAPSHOT
 # =========================================================
 
-def snapshot_registry():
-    """
-    Returns:
-        {
-            "HKCU\\Software\\Foo": {
-                "ValueName": "ValueData",
-                ...
-            }
-        }
-    """
-    snapshot = {}
+def _open_key(hive, path):
+    return winreg.OpenKey(_HIVE_MAP[hive], path)
 
-    for hive_name, hive, base_path in TARGET_HIVES:
+
+def _enum_values(key):
+    values = []
+    i = 0
+    while True:
         try:
-            with winreg.OpenKey(hive, base_path) as root:
-                _walk_key(
-                    snapshot,
-                    hive_name,
-                    base_path,
-                    root,
-                    depth=0,
-                )
-        except Exception:
-            continue
+            name, data, _ = winreg.EnumValue(key, i)
+        except OSError:
+            break
+        values.append((name, data))
+        i += 1
+    return values
 
+
+def _enum_subkeys(key):
+    subkeys = []
+    i = 0
+    while True:
+        try:
+            name = winreg.EnumKey(key, i)
+        except OSError:
+            break
+        with winreg.OpenKey(key, name) as sub:
+            subkeys.append((name, sub))
+        i += 1
+    return subkeys
+
+
+def _get_value(key, name):
+    try:
+        return winreg.QueryValueEx(key, name)[0]
+    except OSError:
+        return None
+
+
+def _read_values_key(entry):
+    full_key = f"{entry['hive']}\\{entry['path']}"
+    snapshot = {}
+    try:
+        key = _open_key(entry["hive"], entry["path"])
+    except OSError:
+        return snapshot
+
+    watch_values = entry.get("watch_values")
+    for name, data in _enum_values(key):
+        if watch_values is None or name in watch_values:
+            snapshot.setdefault(full_key, {})[name] = data
     return snapshot
 
 
-def _walk_key(snapshot, hive_name, path, key, depth):
-    if depth > MAX_DEPTH:
-        return
-
-    full_key = f"{hive_name}\\{path}"
-
-    # --- Enumerate values ---
+def _read_subkey_values_key(entry):
+    base_key_name = f"{entry['hive']}\\{entry['path']}"
+    snapshot = {}
     try:
-        i = 0
-        while True:
-            name, data, _ = winreg.EnumValue(key, i)
-            snapshot.setdefault(full_key, {})[name] = data
-            i += 1
+        key = _open_key(entry["hive"], entry["path"])
     except OSError:
-        pass
+        return snapshot
 
-    # --- Enumerate subkeys ---
+    for sub_name, sub_key in _enum_subkeys(key):
+        child_key_name = f"{base_key_name}\\{sub_name}"
+        for value_name in entry["watch_values"]:
+            data = _get_value(sub_key, value_name)
+            if data is not None:
+                snapshot.setdefault(child_key_name, {})[value_name] = data
+    return snapshot
+
+
+def _read_subkey_presence_key(entry):
+    full_key = f"{entry['hive']}\\{entry['path']}"
+    snapshot = {}
     try:
-        i = 0
-        while True:
-            sub = winreg.EnumKey(key, i)
-            with winreg.OpenKey(key, sub) as subkey:
-                _walk_key(
-                    snapshot,
-                    hive_name,
-                    f"{path}\\{sub}",
-                    subkey,
-                    depth + 1,
-                )
-            i += 1
+        key = _open_key(entry["hive"], entry["path"])
     except OSError:
-        pass
+        return snapshot
+
+    for sub_name, _sub_key in _enum_subkeys(key):
+        snapshot.setdefault(full_key, {})[sub_name] = "present"
+    return snapshot
+
+
+_MODE_READERS = {
+    "values": _read_values_key,
+    "subkey_values": _read_subkey_values_key,
+    "subkey_presence": _read_subkey_presence_key,
+}
+
+
+def snapshot_registry():
+    """
+    returns:
+        {"HKCU\\Software\\Foo": {"ValueName": "ValueData", ...}, ...}
+    """
+    snapshot = {}
+    for entry in PERSISTENCE_KEYS:
+        reader = _MODE_READERS[entry["mode"]]
+        try:
+            partial = reader(entry)
+        except Exception:
+            continue
+        for key, values in partial.items():
+            snapshot.setdefault(key, {}).update(values)
+    return snapshot
 
 
 # =========================================================
