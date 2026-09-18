@@ -1,20 +1,24 @@
 import sys
 import types
 import hashlib
+import shlex
 
 try:
     import wmi
 except ImportError:
     # wmi needs pywin32 and only runs on windows
     # not installed here on this dev/test machine
-    # so build a fake wmi module with just what we need (x_wmi_timed_out, WMI)
+    # so build a fake wmi module with just what we need (x_wmi, x_wmi_timed_out, WMI)
     # register it in sys.modules so every import of wmi anywhere in the process
     # resolves to this same fake instead of retrying a real import that would fail
     # actually connecting still fails loudly, just later, when WMI() is called
     # instead of at import time
     wmi = types.ModuleType("wmi")
 
-    class x_wmi_timed_out(Exception):
+    class x_wmi(Exception):
+        pass
+
+    class x_wmi_timed_out(x_wmi):
         pass
 
     def _WMI():
@@ -24,6 +28,7 @@ except ImportError:
             "requires Windows"
         )
 
+    wmi.x_wmi = x_wmi
     wmi.x_wmi_timed_out = x_wmi_timed_out
     wmi.WMI = _WMI
     sys.modules.setdefault("wmi", wmi)
@@ -51,16 +56,48 @@ def _hash_image(path):
     return digest
 
 
-def _creation_event_to_evidence(wmi_event):
-    image_path = getattr(wmi_event, "ExecutablePath", None)
+def _normalize_cmdline(cmdline_raw):
+    """
+    always return a list of strings, no matter the source.
+    wmi's CommandLine is a single string (or none), psutil's cmdline is already a list.
+    downstream code (persistence_detector, timeline_builder, report_builder) does
+    " ".join(cmdline) and must never see none or a bare string, joining a string
+    joins its characters, not its words.
+    """
+    if not cmdline_raw:
+        return []
+    if isinstance(cmdline_raw, list):
+        return [str(part) for part in cmdline_raw]
+    try:
+        return shlex.split(cmdline_raw)
+    except ValueError:
+        # if the quoting is malformed, shlex raises
+        # fall back to a plain split instead of losing the command line
+        return cmdline_raw.split()
+
+
+def _build_process_create_evidence(pid, ppid, name, cmdline_raw, image_path, create_time):
     return {
-        "pid": wmi_event.ProcessId,
-        "ppid": wmi_event.ParentProcessId,
-        "name": wmi_event.Name,
-        "cmdline": wmi_event.CommandLine,
+        "pid": pid,
+        "ppid": ppid,
+        "name": name,
+        "cmdline": _normalize_cmdline(cmdline_raw),
         "image_path": image_path,
         "image_sha256": _hash_image(image_path) if image_path else None,
+        "create_time": create_time,
     }
+
+
+def _creation_event_to_evidence(wmi_event):
+    image_path = getattr(wmi_event, "ExecutablePath", None)
+    return _build_process_create_evidence(
+        pid=wmi_event.ProcessId,
+        ppid=wmi_event.ParentProcessId,
+        name=wmi_event.Name,
+        cmdline_raw=getattr(wmi_event, "CommandLine", None),
+        image_path=image_path,
+        create_time=getattr(wmi_event, "CreationDate", None),
+    )
 
 
 def _deletion_event_to_evidence(wmi_event):
@@ -107,20 +144,79 @@ class ProcessMonitor:
         if self.is_descendant(event.ProcessId, self.root_pid):
             self.emit("process", "process_terminate", _deletion_event_to_evidence(event))
 
+    def _seed_existing_processes(self):
+        """
+        backfill lineage for every process already running when we attach the watcher.
+        also emit process_create for the root sample and any descendants already running.
+        the wmi creation watcher only sees processes created after watch_for("creation")
+        is called, so without this, the root sample's own creation, and anything that
+        needs to see a process_create first, would never show up.
+        """
+        import psutil
+
+        for proc in psutil.process_iter(["pid", "ppid", "name", "cmdline", "exe"]):
+            try:
+                info = proc.info
+                pid = info["pid"]
+                ppid = info["ppid"]
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+            self.parent_map[pid] = ppid
+            if self.is_descendant(pid, self.root_pid):
+                image_path = info.get("exe")
+                self.emit("process", "process_create", _build_process_create_evidence(
+                    pid=pid,
+                    ppid=ppid,
+                    name=info.get("name"),
+                    cmdline_raw=info.get("cmdline"),
+                    image_path=image_path,
+                    create_time=None,
+                ))
+
     def run(self):
         self.emit("process", "monitor_start", {
             "root_pid": self.root_pid
         })
 
-        conn = _connect_wmi()
-        creation_watcher = conn.Win32_Process.watch_for("creation")
-        deletion_watcher = conn.Win32_Process.watch_for("deletion")
+        # pywin32/wmi needs com initialized on the current thread before its first
+        # com call (wmi.WMI() does this internally)
+        # pywin32 only auto-initializes com for the main thread at import time, not
+        # for threads created later, and this runs on a worker thread started by
+        # ghostrun.py
+        # without this, wmi.WMI() raises a com_error and the thread dies immediately
+        pythoncom = None
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except ImportError:
+            # pythoncom (part of pywin32) isn't installed on this platform
+            # (e.g. this non-windows dev/test host), so there's nothing to initialize
+            pythoncom = None
 
-        while self.running:
-            self._poll_creation(creation_watcher)
-            self._poll_deletion(deletion_watcher)
+        try:
+            try:
+                conn = _connect_wmi()
+                creation_watcher = conn.Win32_Process.watch_for("creation")
+                deletion_watcher = conn.Win32_Process.watch_for("deletion")
 
-        self.emit("process", "monitor_stop", {})
+                self._seed_existing_processes()
+
+                while self.running:
+                    self._poll_creation(creation_watcher)
+                    self._poll_deletion(deletion_watcher)
+            except wmi.x_wmi as exc:
+                # covers com errors, rpc failures, or wmi provider restarts, not just a timeout
+                # (timeouts are already handled in _poll_creation/_poll_deletion)
+                # record this via ghostrun_status (exempt from emit()'s pid filter, so it
+                # actually gets recorded) instead of letting the thread die silently with
+                # no evidence trail
+                self.emit("ghostrun_status", "process_monitor_degraded", {
+                    "error": str(exc),
+                })
+        finally:
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
+            self.emit("process", "monitor_stop", {})
 
     def stop(self):
         self.running = False
