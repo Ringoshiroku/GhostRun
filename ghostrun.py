@@ -17,6 +17,8 @@ from persistence_detector import PersistenceDetector
 from detector_network_inference import NetworkInferenceDetector
 from detector_static_network import StaticNetworkIndicatorDetector
 from filesystem_watch import FilesystemWatcher
+from persistence_watch import PersistenceWatcher
+from mutex_watch import MutexMonitor
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
 import atexit
@@ -320,6 +322,21 @@ def main():
     )
     proc_thread.start()
 
+    # wmi persistence watcher (t1546.003) and named-object (mutex) monitor
+    persistence_watcher = PersistenceWatcher(emit_func=emit, root_pid=ROOTPID)
+    persistence_thread = threading.Thread(
+        target=persistence_watcher.run,
+        daemon=True
+    )
+    persistence_thread.start()
+
+    mutex_monitor = MutexMonitor(emit_func=emit, root_pid=ROOTPID)
+    mutex_thread = threading.Thread(
+        target=mutex_monitor.run,
+        daemon=True
+    )
+    mutex_thread.start()
+
     print("[GhostRun] Monitoring started")
     
     # -----------------------------------------------------
@@ -360,8 +377,12 @@ def main():
     # 7️⃣ Stop monitors cleanly
     # -----------------------------------------------------
     proc_monitor.stop()
+    persistence_watcher.stop()
+    mutex_monitor.stop()
 
     proc_thread.join(timeout=5)
+    persistence_thread.join(timeout=5)
+    mutex_thread.join(timeout=5)
 
     print(f"[GhostRun] Network capture (PID {ROOTPID}): STOP")
     net_capture.stop_and_analyze()
