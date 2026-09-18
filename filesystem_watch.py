@@ -49,6 +49,12 @@ class DebouncedHasher:
             if existing is not None:
                 existing.cancel()
 
+    def cancel_all(self):
+        with self._lock:
+            for timer in self._timers.values():
+                timer.cancel()
+            self._timers.clear()
+
     def _settle(self, path):
         with self._lock:
             self._timers.pop(path, None)
@@ -137,10 +143,38 @@ class FilesystemWatcher:
             handler = _Handler(root_name, self.emit, self.hasher, self.rename_tracker, self.root_pid)
             self._observer.schedule(handler, root_path, recursive=True)
 
+    def _root_for_path(self, path):
+        """
+        best-effort match of a bare path back to whichever configured
+        target root it falls under. targets can nest or overlap (e.g.
+        STARTUP inside APPDATA), so the most specific, longest matching
+        root path wins. returns None when no configured root contains
+        the path.
+        """
+        if not path:
+            return None
+        norm_path = os.path.normpath(path)
+        best_root = None
+        best_len = -1
+        for root_name, root_path in self.targets.items():
+            if not root_path:
+                continue
+            norm_root = os.path.normpath(root_path)
+            try:
+                common = os.path.commonpath([norm_path, norm_root])
+            except ValueError:
+                # e.g. paths on different drives on windows.
+                continue
+            if common == norm_root and len(norm_root) > best_len:
+                best_len = len(norm_root)
+                best_root = root_name
+        return best_root
+
     def _on_hash_settled(self, path, digest):
         if digest is not None:
             self.emit("filesystem_behavior", "file_content_hashed", {
                 "path": path, "sha256": digest, "pid": self.root_pid,
+                "root": self._root_for_path(path),
             })
 
     def _on_ransomware_pattern(self, old_ext, new_ext, count):
@@ -148,6 +182,11 @@ class FilesystemWatcher:
             "from_ext": old_ext, "to_ext": new_ext, "affected_files": count,
             "note": "Pattern consistent with ransomware-style file encryption behavior.",
             "pid": self.root_pid,
+            # RenameExtensionTracker aggregates renames across all targets, and
+            # its on_ransomware_pattern callback carries no path, so no single
+            # root can be named here. use explicit None, not a missing key, so
+            # later code can tell "ambiguous/aggregate" from "forgotten".
+            "root": None,
         })
 
     def start(self):
@@ -155,4 +194,6 @@ class FilesystemWatcher:
 
     def stop(self):
         self._observer.stop()
-        self._observer.join(timeout=5)
+        if self._observer.is_alive():
+            self._observer.join(timeout=5)
+        self.hasher.cancel_all()
