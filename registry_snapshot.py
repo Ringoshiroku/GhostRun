@@ -261,10 +261,25 @@ def diff_registry(before, after, emit, root_pid=None):
 # CLASSIFIER (DERIVED EVIDENCE)
 # =========================================================
 
+_PERSISTENCE_KEY_LOOKUP = {
+    f"{entry['hive']}\\{entry['path']}": entry for entry in PERSISTENCE_KEYS
+}
+
+
+def _find_persistence_entry(key_path):
+    # try an exact match first (values/subkey_presence style).
+    # then walk up one level for subkey_values style (child key under a
+    # watched container).
+    if key_path in _PERSISTENCE_KEY_LOOKUP:
+        return _PERSISTENCE_KEY_LOOKUP[key_path]
+    parent, _, _ = key_path.rpartition("\\")
+    return _PERSISTENCE_KEY_LOOKUP.get(parent)
+
+
 def classify_registry_event(raw_event, emit):
     """
-    Create derived, forensic-grade behavior evidence.
-    NO overclaim.
+    build forensic-grade behavior evidence from a curated,
+    already-known-relevant registry location. don't overclaim.
     """
     key_path = raw_event.get("key", "")
     value_data = (
@@ -272,13 +287,8 @@ def classify_registry_event(raw_event, emit):
         or raw_event.get("after")
         or ""
     )
+    value_data_l = str(value_data).lower()
 
-    value_data_l = value_data.lower()
-    key_l = key_path.lower()
-
-    # -----------------------------------------------------
-    # Execution reference
-    # -----------------------------------------------------
     if EXEC_PATTERN.search(value_data_l):
         emit(
             category="registry_behavior",
@@ -291,19 +301,16 @@ def classify_registry_event(raw_event, emit):
             },
         )
 
-    # -----------------------------------------------------
-    # Suspicious registry location
-    # -----------------------------------------------------
-    for kw in SUSPICIOUS_KEYWORDS:
-        if kw in key_l:
-            emit(
-                category="registry_behavior",
-                event="suspicious_registry_location",
-                confidence="low",
-                data={
-                    "keyword": kw,
-                    "location": key_path,
-                    "value": raw_event.get("value_name"),
-                },
-            )
-            break
+    entry = _find_persistence_entry(key_path)
+    if entry is not None:
+        emit(
+            category="registry_behavior",
+            event="known_persistence_location",
+            confidence=entry["confidence"],
+            data={
+                "category": entry["category"],
+                "attck": entry["attck"],
+                "location": key_path,
+                "value": raw_event.get("value_name"),
+            },
+        )
