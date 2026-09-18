@@ -1,4 +1,5 @@
 import ctypes
+import time
 from ctypes import wintypes
 
 
@@ -81,3 +82,30 @@ def list_named_objects(directory_path=r"\BaseNamedObjects"):
         ntdll.NtClose(handle)
 
     return results
+
+
+class MutexMonitor:
+    def __init__(self, emit_func, poll_interval=5, root_pid=None):
+        self.emit = emit_func
+        self.poll_interval = poll_interval
+        self.root_pid = root_pid
+        self.running = True
+        self._baseline = {}
+
+    def _poll_once(self):
+        current = list_named_objects()
+        new_names = diff_mutexes(self._baseline, current)
+        for name in new_names:
+            self.emit("mutex", "mutex_created", {"name": name, "pid": self.root_pid})
+        self._baseline = current
+
+    def run(self):
+        self._baseline = list_named_objects()
+        while self.running:
+            time.sleep(self.poll_interval)
+            if not self.running:
+                break
+            self._poll_once()
+
+    def stop(self):
+        self.running = False
