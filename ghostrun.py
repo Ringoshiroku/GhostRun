@@ -262,6 +262,20 @@ def main():
     sender_thread.start()
 
     # filesystem watcher
+    # known gap: only covers events from fs_watcher.start() onward
+    # there's no backfill for writes between Popen() returning and here
+    # (unlike ProcessMonitor's process-seeding, past filesystem writes can't
+    # be recovered after the fact)
+    # so a dropper that writes its payload within milliseconds of launch
+    # could be missed
+    # fixing this means starting the watcher before Popen with root_pid=None,
+    # then patching root_pid in live once ROOTPID is known
+    # that needs _Handler (filesystem_watch.py) to read root_pid from its
+    # parent FilesystemWatcher at emit time instead of a value frozen at
+    # _Handler.__init__
+    # that's a fast-follow for filesystem_watch.py, out of scope here since
+    # that file is already reviewed and approved
+    # accepted limitation for now, not an oversight
     fs_watcher = FilesystemWatcher(targets=FS_TARGETS, emit_func=emit, root_pid=ROOTPID)
     fs_watcher.start()
 
