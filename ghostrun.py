@@ -309,6 +309,7 @@ def main():
             event="uncataloged_registry_change",
             confidence="low",
             data={
+                "pid": ROOTPID,
                 "hive": hive,
                 "path": path,
                 "note": (

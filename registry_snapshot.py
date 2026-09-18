@@ -295,6 +295,7 @@ def classify_registry_event(raw_event, emit):
             event="execution_reference_detected",
             confidence="medium",
             data={
+                "pid": raw_event.get("pid"),
                 "path": value_data,
                 "location": key_path,
                 "value": raw_event.get("value_name"),
@@ -308,6 +309,7 @@ def classify_registry_event(raw_event, emit):
             event="known_persistence_location",
             confidence=entry["confidence"],
             data={
+                "pid": raw_event.get("pid"),
                 "category": entry["category"],
                 "attck": entry["attck"],
                 "location": key_path,
