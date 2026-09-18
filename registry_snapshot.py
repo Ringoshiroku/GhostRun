@@ -1,44 +1,68 @@
-import winreg
+import sys
 import re
 
+if sys.platform == "win32":
+    import winreg
+else:
+    # stub for testing on non-Windows platforms
+    winreg = None
+
 # =========================================================
-# SNAPSHOT SCOPE (GLOBAL SELECTIVE)
+# persistence monitoring
 # =========================================================
 
-TARGET_HIVES = [
-    ## HKCU ##
-    ("HKCU", winreg.HKEY_CURRENT_USER, r"Software"),
-    ("HKCU", winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion"),
+PERSISTENCE_KEYS = [
+    # --- Run / RunOnce (T1547.001) ---
+    {"hive": "HKCU", "path": r"Software\Microsoft\Windows\CurrentVersion\Run",
+     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
+    {"hive": "HKCU", "path": r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
+    {"hive": "HKLM", "path": r"Software\Microsoft\Windows\CurrentVersion\Run",
+     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
+    {"hive": "HKLM", "path": r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
+    {"hive": "HKLM", "path": r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
+     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
 
-    ("HKCU", winreg.HKEY_CURRENT_USER, r"Control Panel\\Desktop"),
-    ("HKCU", winreg.HKEY_CURRENT_USER, r"Control Panel\\Personalization"),
-    ("HKCU", winreg.HKEY_CURRENT_USER, r"Environment"),
+    # --- Winlogon Shell/Userinit (T1547.004) ---
+    {"hive": "HKLM", "path": r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon",
+     "mode": "values", "watch_values": ["Shell", "Userinit"],
+     "category": "winlogon", "attck": "T1547.004", "confidence": "high"},
 
-    # CLSID HIJACK / COM hijacking / SHELL OPEN COMMAND (File association hijack)
-    ("HKCU", winreg.HKEY_CURRENT_USER, r"Software\\Classes"),
-    
-    ## HKLM ##
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software"),
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows\\CurrentVersion"),
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion"),
+    # --- Image File Execution Options debugger hijack (T1546.012) ---
+    {"hive": "HKLM",
+     "path": r"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+     "mode": "subkey_values", "watch_values": ["Debugger"],
+     "category": "ifeo_debugger", "attck": "T1546.012", "confidence": "high"},
 
-    # CLSID HIJACK / COM hijacking / SHELL OPEN COMMAND (File association hijack)
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software\\Classes"),
+    # --- AppInit_DLLs (T1546.010) ---
+    {"hive": "HKLM", "path": r"Software\Microsoft\Windows NT\CurrentVersion\Windows",
+     "mode": "values", "watch_values": ["AppInit_DLLs", "LoadAppInit_DLLs"],
+     "category": "appinit_dlls", "attck": "T1546.010", "confidence": "high"},
 
-    # WINLOGON & USERINIT (System execution)
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"),
+    # --- Services (T1543.003) ---
+    {"hive": "HKLM", "path": r"SYSTEM\CurrentControlSet\Services",
+     "mode": "subkey_values", "watch_values": ["ImagePath", "Start", "Type"],
+     "category": "new_service", "attck": "T1543.003", "confidence": "high"},
 
-    # SCHEDULED TASKS (Registry + File)
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tree"),    
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"Software\\Microsoft\\Windows NT\\CurrentVersion\\Schedule\\TaskCache\\Tasks"),    
-    
-    # SERVICES (Persistence via service)
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\\CurrentControlSet\\Services"),    
-    
-    ("HKLM", winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\\CurrentControlSet\\Control"),    
+    # --- Scheduled Tasks (T1053.005) ---
+    {"hive": "HKLM",
+     "path": r"Software\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree",
+     "mode": "subkey_presence", "category": "scheduled_task",
+     "attck": "T1053.005", "confidence": "medium"},
+
+    # --- LSA Security/Authentication Packages (T1547.005) ---
+    {"hive": "HKLM", "path": r"SYSTEM\CurrentControlSet\Control\Lsa",
+     "mode": "values",
+     "watch_values": ["Authentication Packages", "Security Packages", "Notification Packages"],
+     "category": "lsa_packages", "attck": "T1547.005", "confidence": "high"},
+
+    # --- Browser Helper Objects (T1185 adjacent, tracked as execution persistence) ---
+    {"hive": "HKLM",
+     "path": r"Software\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects",
+     "mode": "subkey_presence", "category": "browser_helper_object",
+     "attck": "T1547", "confidence": "medium"},
 ]
-
-MAX_DEPTH = 4
 
 
 # =========================================================
@@ -49,14 +73,6 @@ EXEC_PATTERN = re.compile(
     r"\.(exe|dll|ps1|bat|cmd|vbs|js|hta)",
     re.IGNORECASE,
 )
-
-SUSPICIOUS_KEYWORDS = [
-    "run",
-    "startup",
-    "autorun",
-    "shell",
-    "command",
-]
 
 
 # =========================================================
