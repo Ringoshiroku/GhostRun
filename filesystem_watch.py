@@ -165,7 +165,7 @@ class FilesystemWatcher:
             except ValueError:
                 # e.g. paths on different drives on windows.
                 continue
-            if common == norm_root and len(norm_root) > best_len:
+            if os.path.normcase(common) == os.path.normcase(norm_root) and len(norm_root) > best_len:
                 best_len = len(norm_root)
                 best_root = root_name
         return best_root
