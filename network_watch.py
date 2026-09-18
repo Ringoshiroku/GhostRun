@@ -38,7 +38,7 @@ def infer_service(domain_hits, remote_ip, remote_port):
                 return {"service": "Discord", "confidence": "high", "domains": list(domain_hits)}
 
     for prefix in DISCORD_IP_PREFIX:
-        if remote_ip.startswith(prefix) and remote_port == 443:
+        if remote_ip and remote_ip.startswith(prefix) and remote_port == 443:
             return {"service": "Discord", "confidence": "medium", "domains": list(domain_hits)}
 
     return None
@@ -112,9 +112,29 @@ def parse_eve_file(path):
     return events
 
 
+# events from the capture pipeline that mean real network activity happened.
+# capture_unavailable and capture_failed are excluded: they're degradation
+# notices, not activity. network_finding_engine's own derived
+# malware_network_activity output is excluded too.
+# downstream detectors use this list instead of hardcoding event names, so
+# renaming an event here can't silently break them.
+CAPTURE_ACTIVITY_EVENTS = frozenset({
+    "dns_query", "tls_connection", "http_request", "flow_summary",
+})
+CAPTURE_CONNECTION_EVENTS = frozenset({
+    "tls_connection", "http_request", "flow_summary",
+})
+
+
 _JA3_PIVOT_NOTE = (
     "Pivotable indicator only; TLS fingerprints are randomizable and not "
     "a standalone confidence signal."
+)
+
+# pid is a capture-wide stamp, not per-process attribution: dumpcap captures
+# the whole VM. every emitted event carries this disclaimer alongside pid.
+_PID_ATTRIBUTION_NOTE = (
+    "capture-derived; stamped with the analysis root PID, not per-process attributed"
 )
 
 
@@ -123,15 +143,17 @@ def emit_network_evidence(events, emit_func, root_pid=None):
         if event["event_type"] == "dns":
             emit_func("network_behavior", "dns_query", {
                 "query_name": event["query_name"], "query_type": event["query_type"],
-                "dest_ip": event["dest_ip"],
-                "pid": root_pid,
+                "src_ip": event["src_ip"], "dest_ip": event["dest_ip"],
+                "dest_port": event["dest_port"],
+                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
         elif event["event_type"] == "tls":
             data = {
+                "src_ip": event["src_ip"],
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "sni": event["sni"],
                 "ja3_pivot": {"ja3": event["ja3"], "ja3s": event["ja3s"], "note": _JA3_PIVOT_NOTE},
-                "pid": root_pid,
+                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
             }
             service_info = infer_service({event["sni"]} if event["sni"] else set(), event["dest_ip"], event["dest_port"])
             if service_info:
@@ -139,38 +161,72 @@ def emit_network_evidence(events, emit_func, root_pid=None):
             emit_func("network_behavior", "tls_connection", data)
         elif event["event_type"] == "http":
             emit_func("network_behavior", "http_request", {
-                "dest_ip": event["dest_ip"], "hostname": event["hostname"],
+                "src_ip": event["src_ip"],
+                "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
+                "hostname": event["hostname"],
                 "url": event["url"], "user_agent": event["user_agent"],
-                "pid": root_pid,
+                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
         elif event["event_type"] == "flow":
             emit_func("network_behavior", "flow_summary", {
+                "src_ip": event["src_ip"],
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "start": event["start"], "end": event["end"],
                 "pkts_toserver": event["pkts_toserver"], "pkts_toclient": event["pkts_toclient"],
-                "pid": root_pid,
+                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
 
 
 class NetworkCapture:
-    def __init__(self, pcap_path, eve_log_dir, emit_func, sslkeylogfile_path=None, root_pid=None):
+    def __init__(self, pcap_path, eve_log_dir, emit_func, sslkeylogfile_path=None, root_pid=None,
+                 exclude_host=None, exclude_port=None):
         self.pcap_path = pcap_path
         self.eve_log_dir = eve_log_dir
         self.emit = emit_func
         self.sslkeylogfile_path = sslkeylogfile_path
         self.root_pid = root_pid
+        # excluded from capture so GhostRun's own evidence-sender traffic to the
+        # receiver isn't mistaken for the sample's own C2 traffic. Suricata would
+        # otherwise parse it as real http/flow events and stamp it with root_pid
+        # like any other traffic.
+        self.exclude_host = exclude_host
+        self.exclude_port = exclude_port
         self._proc = None
         self._tools_available = bool(shutil.which("dumpcap")) and bool(shutil.which("suricata"))
+
+    @property
+    def tools_available(self):
+        return self._tools_available
 
     def start(self):
         if not self._tools_available:
             return
+        cmd = ["dumpcap", "-w", self.pcap_path, "-q"]
+        if self.exclude_host:
+            filter_parts = f"not (host {self.exclude_host}"
+            if self.exclude_port:
+                filter_parts += f" and tcp port {self.exclude_port}"
+            filter_parts += ")"
+            cmd += ["-f", filter_parts]
         self._proc = subprocess.Popen(
-            ["dumpcap", "-w", self.pcap_path, "-q"],
+            cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
 
     def stop_and_analyze(self):
+        # any exception below must turn into a logged evidence event, never
+        # propagate. this runs before ghostrun.py writes the local evidence backup,
+        # so an unhandled exception here used to destroy all evidence from the
+        # whole analysis run.
+        try:
+            self._stop_and_analyze()
+        except Exception as exc:
+            self.emit("network_behavior", "capture_failed", {
+                "reason": f"{type(exc).__name__}: {exc}",
+                "pid": self.root_pid,
+            })
+
+    def _stop_and_analyze(self):
         if not self._tools_available:
             self.emit("network_behavior", "capture_unavailable", {
                 "reason": "dumpcap and/or suricata not found on PATH",
@@ -186,10 +242,22 @@ class NetworkCapture:
         if self.sslkeylogfile_path:
             env["SSLKEYLOGFILE"] = self.sslkeylogfile_path
 
-        subprocess.run(
-            ["suricata", "-r", self.pcap_path, "-l", self.eve_log_dir, "-k", "none"],
-            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+        result = subprocess.run(
+            [
+                "suricata", "-r", self.pcap_path, "-l", self.eve_log_dir, "-k", "none",
+                "--set", "app-layer.protocols.tls.ja3-fingerprints=yes",
+                "--set", "app-layer.protocols.tls.ja4-fingerprints=yes",
+            ],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120,
         )
+
+        if result.returncode != 0:
+            stderr_tail = (result.stderr or "")[-2000:]
+            self.emit("network_behavior", "capture_failed", {
+                "reason": f"suricata exited with code {result.returncode}: {stderr_tail}",
+                "pid": self.root_pid,
+            })
+            return
 
         eve_path = os.path.join(self.eve_log_dir, "eve.json")
         if os.path.exists(eve_path):
