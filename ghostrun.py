@@ -12,6 +12,7 @@ from sender_http import PutEvidenceSender
 from network_monitor import NetworkMonitor
 from process_mon import ProcessMonitor
 from registry_snapshot import snapshot_registry, diff_registry
+from registry_watch import RegistryWatcher
 from persistence_detector import PersistenceDetector
 from detector_network_inference import NetworkInferenceDetector
 from detector_static_network import StaticNetworkIndicatorDetector
@@ -218,6 +219,14 @@ def main():
     print(f"[GhostRun] Registry snapshot: BEFORE")
     reg_before = snapshot_registry()
 
+    triggered_roots = set()
+
+    def _on_registry_root_changed(hive, path):
+        triggered_roots.add((hive, path))
+
+    registry_watcher = RegistryWatcher(on_change=_on_registry_root_changed)
+    registry_watcher.start()
+
     print("[GhostRun] Filesystem snapshot: BEFORE")
     fs_before = snapshot_filesystem_multi(FS_TARGETS)
     
@@ -290,7 +299,24 @@ def main():
     # -----------------------------------------------------
     print(f"[GhostRun] Registry snapshot (PID {ROOTPID}): AFTER")
     reg_after = snapshot_registry()
+
+    registry_watcher.stop()
     diff_registry(reg_before, reg_after, emit, ROOTPID)
+
+    for hive, path in triggered_roots:
+        emit(
+            category="registry_behavior",
+            event="uncataloged_registry_change",
+            confidence="low",
+            data={
+                "hive": hive,
+                "path": path,
+                "note": (
+                    "A change occurred under this broad root outside the "
+                    "curated persistence key list. Manual review recommended."
+                ),
+            },
+        )
 
     print(f"[GhostRun] Filesystem snapshot (PID {ROOTPID}): AFTER")
     fs_after = snapshot_filesystem_multi(FS_TARGETS)
