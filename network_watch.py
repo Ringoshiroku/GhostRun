@@ -7,6 +7,9 @@ def parse_eve_line(line):
     except json.JSONDecodeError:
         return None
 
+    if not isinstance(raw, dict):
+        return None
+
     event_type = raw.get("event_type")
     base = {
         "event_type": event_type,
