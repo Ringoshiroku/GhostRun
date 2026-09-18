@@ -1,5 +1,7 @@
 from collections import defaultdict
 
+from network_watch import CAPTURE_CONNECTION_EVENTS
+
 
 class PersistenceDetector:
     def __init__(self):
@@ -26,7 +28,7 @@ class PersistenceDetector:
                 self.process_execs.add(cmd.lower())
 
         # network activity
-        elif category == "network" and event == "connection":
+        elif category == "network_behavior" and event in CAPTURE_CONNECTION_EVENTS:
             pid = data.get("pid")
             if pid:
                 self.network_pids.add(pid)
@@ -51,13 +53,18 @@ class PersistenceDetector:
                     derived_from=[
                         "registry_behavior:execution_reference_detected",
                         "process:process_create",
-                        "network:connection",
+                        "network_behavior:tls_connection|http_request|flow_summary",
                     ],
                     data={
                         "pid": ref.get("pid"),
-                        "path": ref.get("path"),                    
+                        "path": ref.get("path"),
                         "location": location,
-                        "note": "Executable referenced in registry was executed and established outbound network connection.",
+                        "note": (
+                            "Executable referenced in registry was executed and outbound "
+                            "network activity was observed during the analysis window. "
+                            "pid is capture-derived, stamped with the analysis root PID, "
+                            "not per-process attributed."
+                        ),
                     },
                 )
 

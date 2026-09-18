@@ -1,6 +1,8 @@
 import re
 import os
 
+from network_watch import CAPTURE_ACTIVITY_EVENTS
+
 
 IP_REGEX = re.compile(
     r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
@@ -51,7 +53,7 @@ class NetworkInferenceDetector:
         if category == "process" and event == "process_create":
             self.process_seen = True
 
-        elif category == "network":
+        elif category == "network_behavior" and event in CAPTURE_ACTIVITY_EVENTS:
             self.network_seen = True
 
     # --------------------------------------------------
