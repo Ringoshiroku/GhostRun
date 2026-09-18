@@ -64,6 +64,11 @@ PERSISTENCE_KEYS = [
      "path": r"Software\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects",
      "mode": "subkey_presence", "category": "browser_helper_object",
      "attck": "T1547", "confidence": "medium"},
+
+    # --- Desktop Wallpaper Defacement (T1491.001) ---
+    {"hive": "HKCU", "path": r"Control Panel\Desktop",
+     "mode": "values", "watch_values": ["Wallpaper", "TranscodedImageCache"],
+     "category": "desktop_defacement", "attck": "T1491.001", "confidence": "medium"},
 ]
 
 
