@@ -9,7 +9,7 @@ import os
 import queue
 from datetime import datetime, timezone
 from sender_http import PutEvidenceSender
-from network_monitor import NetworkMonitor
+from network_watch import NetworkCapture
 from process_mon import ProcessMonitor
 from registry_snapshot import snapshot_registry, diff_registry
 from registry_watch import RegistryWatcher
@@ -84,7 +84,7 @@ def emit(category, event, data, **meta):
     if network_infer:
         network_infer.ingest(category, event, data)
 
-    if category == "network":
+    if category == "network_behavior" and event != "capture_unavailable":
         NETWORK_EVENT_COUNT += 1
 
     if not SENDER:
@@ -230,19 +230,38 @@ def main():
     registry_watcher.start()
 
     # -----------------------------------------------------
-    # 3️⃣ Execute sample
+    # 3. start network capture, then run the sample
     # -----------------------------------------------------
+    # SSLKEYLOGFILE must be set before Popen() so the sample process inherits
+    # it. opportunistic: only helps if the sample uses an SSLKEYLOGFILE-aware
+    # TLS stack
+    # capture starts before the sample launches so it doesn't miss early traffic
+    # ROOTPID isn't known yet, so net_capture is built with root_pid=None and
+    # patched in live once the sample's PID is known, same as FilesystemWatcher
+    # above
+    sslkeylogfile_path = os.path.join(os.path.dirname(args.file), "sslkeylog.txt")
+    os.environ["SSLKEYLOGFILE"] = sslkeylogfile_path  # set before sample launch, opportunistic
+
+    net_capture = NetworkCapture(
+        pcap_path=os.path.join(os.path.dirname(args.file), "capture.pcap"),
+        eve_log_dir=os.path.dirname(args.file),
+        emit_func=emit,
+        sslkeylogfile_path=sslkeylogfile_path,
+    )
+    net_capture.start()
+
     try:
         proc = subprocess.Popen(args.sample)
         ROOTPID = proc.pid
         MALWARE_PIDS.add(ROOTPID)
+        net_capture.root_pid = ROOTPID
 
         MALWARE_IDENTITY.update({
             "pid": ROOTPID,
             "path": args.sample,
             "name": os.path.basename(args.sample)
-        })        
-        
+        })
+
         print(f"[GhostRun] Sample executed (PID {ROOTPID})")
     except Exception as e:
         print(f"[GhostRun] ERROR: Failed to execute sample: {e}")
@@ -296,14 +315,6 @@ def main():
     )
     proc_thread.start()
 
-
-    # Network monitor
-    net_monitor = NetworkMonitor(
-        emit=emit,
-        interval=1
-    )
-    net_monitor.start()
-    
     print("[GhostRun] Monitoring started")
     
     # -----------------------------------------------------
@@ -344,10 +355,11 @@ def main():
     # 7️⃣ Stop monitors cleanly
     # -----------------------------------------------------
     proc_monitor.stop()
-    net_monitor.stop()
 
     proc_thread.join(timeout=5)
-    net_monitor.join(timeout=5)
+
+    print(f"[GhostRun] Network capture (PID {ROOTPID}): STOP")
+    net_capture.stop_and_analyze()
 
     persistence.analyze(emit)
     network_infer.analyze(emit)

@@ -1,5 +1,8 @@
 import json
+import os
+import shutil
 import socket
+import subprocess
 
 TELEGRAM_IP_RANGES = [
     ("149.154.0.0", "149.154.255.255"),
@@ -147,3 +150,47 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "pkts_toserver": event["pkts_toserver"], "pkts_toclient": event["pkts_toclient"],
                 "pid": root_pid,
             })
+
+
+class NetworkCapture:
+    def __init__(self, pcap_path, eve_log_dir, emit_func, sslkeylogfile_path=None, root_pid=None):
+        self.pcap_path = pcap_path
+        self.eve_log_dir = eve_log_dir
+        self.emit = emit_func
+        self.sslkeylogfile_path = sslkeylogfile_path
+        self.root_pid = root_pid
+        self._proc = None
+        self._tools_available = bool(shutil.which("dumpcap")) and bool(shutil.which("suricata"))
+
+    def start(self):
+        if not self._tools_available:
+            return
+        self._proc = subprocess.Popen(
+            ["dumpcap", "-w", self.pcap_path, "-q"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    def stop_and_analyze(self):
+        if not self._tools_available:
+            self.emit("network_behavior", "capture_unavailable", {
+                "reason": "dumpcap and/or suricata not found on PATH",
+                "pid": self.root_pid,
+            })
+            return
+
+        if self._proc is not None:
+            self._proc.terminate()
+            self._proc.wait(timeout=10)
+
+        env = os.environ.copy()
+        if self.sslkeylogfile_path:
+            env["SSLKEYLOGFILE"] = self.sslkeylogfile_path
+
+        subprocess.run(
+            ["suricata", "-r", self.pcap_path, "-l", self.eve_log_dir, "-k", "none"],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+        )
+
+        eve_path = os.path.join(self.eve_log_dir, "eve.json")
+        if os.path.exists(eve_path):
+            emit_network_evidence(parse_eve_file(eve_path), self.emit, root_pid=self.root_pid)
