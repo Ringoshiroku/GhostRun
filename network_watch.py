@@ -1,4 +1,44 @@
 import json
+import socket
+
+TELEGRAM_IP_RANGES = [
+    ("149.154.0.0", "149.154.255.255"),
+    ("91.108.0.0", "91.108.255.255"),
+]
+DISCORD_DOMAINS = ["discord.com", "discordapp.com", "discord.gg", "gateway.discord.gg"]
+DISCORD_IP_PREFIX = ["162.159.", "104.16.", "104.17."]
+
+
+def ip_to_int(ip):
+    try:
+        return int.from_bytes(socket.inet_aton(ip), "big")
+    except Exception:
+        return None
+
+
+def ip_in_range(ip, start, end):
+    ip_i = ip_to_int(ip)
+    if ip_i is None:
+        return False
+    return ip_to_int(start) <= ip_i <= ip_to_int(end)
+
+
+def infer_service(domain_hits, remote_ip, remote_port):
+    if remote_port == 443:
+        for start, end in TELEGRAM_IP_RANGES:
+            if ip_in_range(remote_ip, start, end):
+                return {"service": "Telegram", "confidence": "medium", "domains": list(domain_hits)}
+
+    for d in domain_hits:
+        for sig in DISCORD_DOMAINS:
+            if sig in d.lower():
+                return {"service": "Discord", "confidence": "high", "domains": list(domain_hits)}
+
+    for prefix in DISCORD_IP_PREFIX:
+        if remote_ip.startswith(prefix) and remote_port == 443:
+            return {"service": "Discord", "confidence": "medium", "domains": list(domain_hits)}
+
+    return None
 
 
 def parse_eve_line(line):
@@ -84,12 +124,16 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "pid": root_pid,
             })
         elif event["event_type"] == "tls":
-            emit_func("network_behavior", "tls_connection", {
+            data = {
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "sni": event["sni"],
                 "ja3_pivot": {"ja3": event["ja3"], "ja3s": event["ja3s"], "note": _JA3_PIVOT_NOTE},
                 "pid": root_pid,
-            })
+            }
+            service_info = infer_service({event["sni"]} if event["sni"] else set(), event["dest_ip"], event["dest_port"])
+            if service_info:
+                data.update(service_info)
+            emit_func("network_behavior", "tls_connection", data)
         elif event["event_type"] == "http":
             emit_func("network_behavior", "http_request", {
                 "dest_ip": event["dest_ip"], "hostname": event["hostname"],
