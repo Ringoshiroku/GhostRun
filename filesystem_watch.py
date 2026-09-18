@@ -207,6 +207,25 @@ class FilesystemWatcher:
                 "path": path, "sha256": digest, "pid": self.root_pid,
                 "root": self._root_for_path(path),
             })
+            return
+
+        # hash_file returns None both for a missing/unreadable file and
+        # for a file over size_cap_bytes, but the two mean different
+        # things. a missing file already has its own file_deleted event,
+        # so staying silent there is fine. an over-cap file otherwise
+        # leaves no evidence that hashing was even attempted, so check
+        # the file's current size to tell the cases apart, and emit an
+        # explicit, hash-less record for the over-cap case.
+        try:
+            over_cap = os.path.getsize(path) > self.hasher.size_cap_bytes
+        except OSError:
+            over_cap = False
+
+        if over_cap:
+            self.emit("filesystem_behavior", "file_content_hashed", {
+                "path": path, "sha256": None, "reason": "size_cap_exceeded",
+                "pid": self.root_pid, "root": self._root_for_path(path),
+            })
 
     def _on_ransomware_pattern(self, old_ext, new_ext, count):
         self.emit("filesystem_behavior", "mass_extension_change", {
