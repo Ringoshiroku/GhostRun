@@ -6,6 +6,9 @@ _HASH_CACHE = {}
 
 
 def _hash_image(path):
+    if not path:
+        return None
+
     if path in _HASH_CACHE:
         return _HASH_CACHE[path]
 
@@ -15,7 +18,7 @@ def _hash_image(path):
             for chunk in iter(lambda: f.read(65536), b""):
                 h.update(chunk)
         digest = h.hexdigest()
-    except (OSError, PermissionError):
+    except OSError:
         return None
 
     _HASH_CACHE[path] = digest
