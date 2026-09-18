@@ -99,6 +99,10 @@ def _enum_values(key):
 
 
 def _enum_subkeys(key):
+    # handles come back open, not closed here with a `with` block.
+    # this lets the caller read values through them after this returns.
+    # the caller must close each handle once it's done with it.
+    # see _read_subkey_values_key / _read_subkey_presence_key below.
     subkeys = []
     i = 0
     while True:
@@ -106,8 +110,7 @@ def _enum_subkeys(key):
             name = winreg.EnumKey(key, i)
         except OSError:
             break
-        with winreg.OpenKey(key, name) as sub:
-            subkeys.append((name, sub))
+        subkeys.append((name, winreg.OpenKey(key, name)))
         i += 1
     return subkeys
 
@@ -144,10 +147,14 @@ def _read_subkey_values_key(entry):
 
     for sub_name, sub_key in _enum_subkeys(key):
         child_key_name = f"{base_key_name}\\{sub_name}"
-        for value_name in entry["watch_values"]:
-            data = _get_value(sub_key, value_name)
-            if data is not None:
-                snapshot.setdefault(child_key_name, {})[value_name] = data
+        try:
+            for value_name in entry["watch_values"]:
+                data = _get_value(sub_key, value_name)
+                if data is not None:
+                    snapshot.setdefault(child_key_name, {})[value_name] = data
+        finally:
+            if winreg is not None:
+                winreg.CloseKey(sub_key)
     return snapshot
 
 
@@ -159,8 +166,10 @@ def _read_subkey_presence_key(entry):
     except OSError:
         return snapshot
 
-    for sub_name, _sub_key in _enum_subkeys(key):
+    for sub_name, sub_key in _enum_subkeys(key):
         snapshot.setdefault(full_key, {})[sub_name] = "present"
+        if winreg is not None:
+            winreg.CloseKey(sub_key)
     return snapshot
 
 
