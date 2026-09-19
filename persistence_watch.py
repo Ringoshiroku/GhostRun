@@ -38,6 +38,18 @@ except ImportError:
 
 _WATCHED_CLASSES = ["__EventFilter", "__EventConsumer", "__FilterToConsumerBinding"]
 
+# same disclaimer wording persistence_detector.py already uses
+# for its capture-derived, pid-stamped-but-not-per-process
+# findings.
+# root\subscription is a system-wide namespace: any WMI event
+# filter/consumer/binding created by any process during the
+# analysis window, not just the sample, gets stamped with
+# root_pid here.
+_ATTRIBUTION_NOTE = (
+    "pid is capture-derived, stamped with the analysis root PID, "
+    "not per-process attributed."
+)
+
 
 def _wmi_object_properties(wmi_obj):
     result = {}
@@ -53,6 +65,7 @@ def _persistence_event_to_evidence(wmi_event, class_name):
         "wmi_class": class_name,
         "attck": "T1546.003",
         "properties": _wmi_object_properties(wmi_event),
+        "note": _ATTRIBUTION_NOTE,
     }
 
 
@@ -76,6 +89,8 @@ class PersistenceWatcher:
         self.emit("persistence", "wmi_event_subscription_created", evidence)
 
     def run(self):
+        self.emit("persistence", "monitor_start", {"root_pid": self.root_pid})
+
         # pywin32/wmi needs COM initialized on any thread before its
         # first COM call (wmi.WMI() does this under the hood).
         # pywin32 only auto-initializes COM for the main thread at
@@ -116,6 +131,7 @@ class PersistenceWatcher:
         finally:
             if pythoncom is not None:
                 pythoncom.CoUninitialize()
+            self.emit("persistence", "monitor_stop", {})
 
     def stop(self):
         self.running = False
