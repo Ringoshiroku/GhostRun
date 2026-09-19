@@ -18,7 +18,7 @@ from detector_network_inference import NetworkInferenceDetector
 from detector_static_network import StaticNetworkIndicatorDetector
 from filesystem_watch import FilesystemWatcher
 from persistence_watch import PersistenceWatcher
-from mutex_watch import MutexMonitor
+from mutex_watch import MutexMonitor, list_all_named_objects
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
 import atexit
@@ -226,6 +226,15 @@ def main():
     print(f"[GhostRun] Registry snapshot: BEFORE")
     reg_before = snapshot_registry()
 
+    # mutex/named-object baseline must be captured before Popen() below too,
+    # same reasoning as reg_before
+    # a single-instance mutex is usually created within the sample's first
+    # few milliseconds
+    # baselining after the sample is already running would permanently diff
+    # it away as "pre-existing" and it would never get reported
+    print(f"[GhostRun] Mutex/named-object baseline: BEFORE")
+    mutex_before, _ = list_all_named_objects()
+
     triggered_roots = set()
 
     def _on_registry_root_changed(hive, path):
@@ -330,7 +339,7 @@ def main():
     )
     persistence_thread.start()
 
-    mutex_monitor = MutexMonitor(emit_func=emit, root_pid=ROOTPID)
+    mutex_monitor = MutexMonitor(emit_func=emit, root_pid=ROOTPID, baseline=mutex_before)
     mutex_thread = threading.Thread(
         target=mutex_monitor.run,
         daemon=True
