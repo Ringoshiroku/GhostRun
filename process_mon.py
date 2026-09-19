@@ -21,7 +21,14 @@ except ImportError:
     class x_wmi_timed_out(x_wmi):
         pass
 
-    def _WMI():
+    def _WMI(**kwargs):
+        # accepts **kwargs (unused) so this stub matches persistence_watch.py's stub
+        # both modules register their stub via sys.modules.setdefault("wmi", ...)
+        # whichever one imports first (process_mon.py, per ghostrun.py's import order)
+        # installs the stub the other module's call sites actually use
+        # if the signatures ever differed, wmi.WMI(namespace=...) from
+        # persistence_watch.py would raise a plain TypeError instead of this
+        # intended RuntimeError
         raise RuntimeError(
             "the 'wmi' package (Windows-only, requires pywin32) is not "
             "available on this platform; process monitoring via WMI events "
