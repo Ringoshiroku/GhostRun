@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from sender_http import PutEvidenceSender
 from network_watch import NetworkCapture, CAPTURE_ACTIVITY_EVENTS
 from process_mon import ProcessMonitor
-from registry_snapshot import snapshot_registry, diff_registry
+from registry_snapshot import snapshot_registry, snapshot_registry_subtree, diff_registry
 from registry_watch import RegistryWatcher
 from persistence_detector import PersistenceDetector
 from detector_network_inference import NetworkInferenceDetector
@@ -243,6 +243,17 @@ def main():
     registry_watcher = RegistryWatcher(on_change=_on_registry_root_changed)
     registry_watcher.start()
 
+    # broad-root baseline for the watcher's catch-all roots, taken now for the
+    # same reason as reg_before: you can't retroactively capture "before" once
+    # something has already changed
+    # paid once per root here; the matching AFTER walk below only runs for
+    # roots that actually fired, not all of them, so a quiet run costs
+    # nothing extra beyond this
+    broad_root_before = {
+        (hive, path): snapshot_registry_subtree(hive, path)
+        for hive, path in registry_watcher.watched_roots
+    }
+
     # -----------------------------------------------------
     # 3. start network capture, then run the sample
     # -----------------------------------------------------
@@ -367,22 +378,16 @@ def main():
     registry_watcher.stop()
     diff_registry(reg_before, reg_after, emit, ROOTPID)
 
+    # real targeted diff for whichever broad roots actually fired, instead of
+    # a content-free notice
+    # reuses diff_registry/classify_registry_event unchanged, which already
+    # correctly withholds known_persistence_location for anything outside the
+    # curated PERSISTENCE_KEYS list
+    # still surfaces the raw change and, where applicable,
+    # execution_reference_detected
     for hive, path in sorted(triggered_roots):
-        emit(
-            category="ghostrun_status",
-            event="uncataloged_registry_change",
-            confidence="low",
-            data={
-                "hive": hive,
-                "path": path,
-                "note": (
-                    "Registry activity observed under this broad root during "
-                    "the analysis window. This mechanism cannot attribute the "
-                    "change to a specific process; treat as informational "
-                    "context, not a sample-attributed finding."
-                ),
-            },
-        )
+        broad_root_after = snapshot_registry_subtree(hive, path)
+        diff_registry(broad_root_before[(hive, path)], broad_root_after, emit, ROOTPID)
 
     print(f"[GhostRun] Filesystem watcher (PID {ROOTPID}): STOP")
     fs_watcher.stop()
