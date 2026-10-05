@@ -69,6 +69,33 @@ PERSISTENCE_KEYS = [
     {"hive": "HKCU", "path": r"Control Panel\Desktop",
      "mode": "values", "watch_values": ["Wallpaper", "TranscodedImageCache"],
      "category": "desktop_defacement", "attck": "T1491.001", "confidence": "medium"},
+
+    # --- COM/CLSID hijack (T1546.015): the hijacked value sits on
+    # CLSID\{guid}\InprocServer32 or \LocalServer32's default value, one
+    # level below the CLSID subkeys this walks. scoped to HKCU, the
+    # common variant that doesn't need admin rights (HKLM's CLSID tree is
+    # much bigger and needs elevation to write to). ---
+    {"hive": "HKCU", "path": r"Software\Classes\CLSID",
+     "mode": "subkey_child_values", "watch_subkeys": ["InprocServer32", "LocalServer32"],
+     "category": "com_hijack", "attck": "T1546.015", "confidence": "high"},
+
+    # --- file association hijack via shell\open\command (T1546.001
+    # adjacent): "*" is the fallback handler for every file type, so a
+    # hijack there runs on any file open; exefile covers .exe launches
+    # specifically. ---
+    {"hive": "HKCU", "path": r"Software\Classes\*\shell\open\command",
+     "mode": "values", "category": "file_assoc_hijack", "attck": "T1546.001", "confidence": "high"},
+    {"hive": "HKCU", "path": r"Software\Classes\exefile\shell\open\command",
+     "mode": "values", "category": "file_assoc_hijack", "attck": "T1546.001", "confidence": "high"},
+
+    # --- environment variable persistence (T1574.012 adjacent, e.g.
+    # COR_PROFILER .NET profiler hijacking, or UserInitMprLogonScript) ---
+    {"hive": "HKCU", "path": r"Environment",
+     "mode": "values", "category": "environment_persistence", "attck": "T1574.012", "confidence": "medium"},
+
+    # --- Control Panel\Personalization tampering ---
+    {"hive": "HKCU", "path": r"Control Panel\Personalization",
+     "mode": "values", "category": "personalization_tamper", "attck": "T1491.001", "confidence": "low"},
 ]
 
 
@@ -163,6 +190,41 @@ def _read_subkey_values_key(entry):
     return snapshot
 
 
+def _read_subkey_child_values_key(entry):
+    # like _read_subkey_values_key, but the watched value sits one level
+    # deeper: under a named sub-subkey of each child (e.g.
+    # CLSID\{guid}\InprocServer32's default value), not on the child itself.
+    # reads only the default value (name "") of each entry["watch_subkeys"]
+    # sub-subkey found under each child.
+    # a child missing every watched sub-subkey gets no entry in the result.
+    base_key_name = f"{entry['hive']}\\{entry['path']}"
+    snapshot = {}
+    try:
+        key = _open_key(entry["hive"], entry["path"])
+    except OSError:
+        return snapshot
+
+    for sub_name, sub_key in _enum_subkeys(key):
+        child_key_name = f"{base_key_name}\\{sub_name}"
+        try:
+            for subsubkey_name in entry["watch_subkeys"]:
+                try:
+                    grandchild = winreg.OpenKey(sub_key, subsubkey_name)
+                except OSError:
+                    continue
+                try:
+                    data = _get_value(grandchild, "")
+                finally:
+                    if winreg is not None:
+                        winreg.CloseKey(grandchild)
+                if data is not None:
+                    snapshot.setdefault(child_key_name, {})[subsubkey_name] = data
+        finally:
+            if winreg is not None:
+                winreg.CloseKey(sub_key)
+    return snapshot
+
+
 def _read_subkey_presence_key(entry):
     full_key = f"{entry['hive']}\\{entry['path']}"
     snapshot = {}
@@ -182,6 +244,7 @@ _MODE_READERS = {
     "values": _read_values_key,
     "subkey_values": _read_subkey_values_key,
     "subkey_presence": _read_subkey_presence_key,
+    "subkey_child_values": _read_subkey_child_values_key,
 }
 
 
@@ -200,6 +263,49 @@ def snapshot_registry():
             continue
         for key, values in partial.items():
             snapshot.setdefault(key, {}).update(values)
+    return snapshot
+
+
+def _walk_subtree(hive_name, path, key, depth, max_depth, snapshot):
+    full_key = f"{hive_name}\\{path}"
+    for name, data in _enum_values(key):
+        snapshot.setdefault(full_key, {})[name] = data
+
+    if depth >= max_depth:
+        return
+
+    for sub_name, sub_key in _enum_subkeys(key):
+        try:
+            _walk_subtree(hive_name, f"{path}\\{sub_name}", sub_key, depth + 1, max_depth, snapshot)
+        finally:
+            if winreg is not None:
+                winreg.CloseKey(sub_key)
+
+
+def snapshot_registry_subtree(hive, path, max_depth=4):
+    """
+    recursive, depth-capped snapshot of one registry subtree.
+    returns the same {full_key: {name: data}} shape as
+    snapshot_registry(), so diff_registry() works on it unchanged.
+
+    unlike snapshot_registry()'s curated PERSISTENCE_KEYS dispatch,
+    this walks everything under the given root up to max_depth
+    (default 4, matching the original tool's MAX_DEPTH before the
+    curated list replaced it).
+
+    used for RegistryWatcher's broad catch-all roots, which exist to
+    catch activity outside the curated list.
+    """
+    snapshot = {}
+    try:
+        key = _open_key(hive, path)
+    except OSError:
+        return snapshot
+    try:
+        _walk_subtree(hive, path, key, depth=0, max_depth=max_depth, snapshot=snapshot)
+    finally:
+        if winreg is not None:
+            winreg.CloseKey(key)
     return snapshot
 
 
