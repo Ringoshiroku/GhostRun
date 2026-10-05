@@ -195,7 +195,8 @@ def snapshot_registry():
         reader = _MODE_READERS[entry["mode"]]
         try:
             partial = reader(entry)
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] snapshot failed: {entry['hive']}\\{entry['path']} -> {type(e).__name__}: {e}")
             continue
         for key, values in partial.items():
             snapshot.setdefault(key, {}).update(values)

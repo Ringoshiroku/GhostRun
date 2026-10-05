@@ -253,12 +253,17 @@ def main():
     # ROOTPID isn't known yet, so net_capture is built with root_pid=None and
     # patched in live once the sample's PID is known, same as FilesystemWatcher
     # above
-    sslkeylogfile_path = os.path.join(os.path.dirname(args.file), "sslkeylog.txt")
+    # os.path.dirname(args.file) is "" when --file is a bare filename with no
+    # directory part, and suricata's -l flag rejects that outright ("logging
+    # directory "" ... doesn't exist")
+    # fall back to the current directory in that case
+    out_dir = os.path.dirname(args.file) or "."
+    sslkeylogfile_path = os.path.join(out_dir, "sslkeylog.txt")
     os.environ["SSLKEYLOGFILE"] = sslkeylogfile_path  # set before sample launch, opportunistic
 
     net_capture = NetworkCapture(
-        pcap_path=os.path.join(os.path.dirname(args.file), "capture.pcap"),
-        eve_log_dir=os.path.dirname(args.file),
+        pcap_path=os.path.join(out_dir, "capture.pcap"),
+        eve_log_dir=out_dir,
         emit_func=emit,
         sslkeylogfile_path=sslkeylogfile_path,
         exclude_host=args.host,

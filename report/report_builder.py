@@ -1,4 +1,5 @@
 import os
+import re
 import json
 from datetime import datetime
 from collections import defaultdict
@@ -468,7 +469,14 @@ class MarkdownReportBuilder:
                             if p.lower().endswith((".exe", ".dll", ".ps1")):
                                 self.soft_iocs["Dropped File"].add(p)
 
-                            if "read" in p.lower():
+                            # token-based on the basename, not a raw substring check
+                            # against the whole path. a plain "read" in p.lower() false-
+                            # positives on ordinary filenames like
+                            # api-ms-win-core-proces[read]s-l1-1-0.dll ("threads" contains
+                            # "read"). same fix in timeline_builder.py.
+                            fname = os.path.basename(p).lower()
+                            tokens = re.split(r"[^a-z0-9]+", fname)
+                            if any(t.startswith(("read", "decrypt", "recover")) for t in tokens):
                                 self.soft_iocs["Ransom Note"].add(p)
 
             ## registry

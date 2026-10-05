@@ -13,6 +13,9 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 class GhostRunPUTHandler(SimpleHTTPRequestHandler):
     def do_PUT(self):
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+
         if self.path.startswith("/backup/"):
             filename = os.path.basename(self.path)
             full_path = os.path.join(BASE_DIR, "backup", filename)
@@ -27,9 +30,6 @@ class GhostRunPUTHandler(SimpleHTTPRequestHandler):
             self.send_response(201)
             self.end_headers()
             return
-
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
 
         try:
             data = json.loads(raw.decode("utf-8"))

@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import datetime
 import os
+import re
 
 
 class TimelineBuilder:
@@ -82,7 +83,16 @@ class TimelineBuilder:
                 p = data.get("path")
                 if p:
                     fname = os.path.basename(p).lower()
-                    if "read" in fname or "decrypt" in fname or "recover" in fname:
+                    # token-based match, not a raw substring check.
+                    # a plain "read" substring would false-positive on normal
+                    # filenames like api-ms-win-core-proces[read]s-l1-1-0.dll
+                    # ("threads" contains "read").
+                    # split on non-alnum separators and require a whole token
+                    # to start with the keyword. still matches real note names
+                    # (readme, read_me, decrypt_files, how-to-recover) without
+                    # matching substrings buried inside unrelated words.
+                    tokens = re.split(r"[^a-z0-9]+", fname)
+                    if any(t.startswith(("read", "decrypt", "recover")) for t in tokens):
                         self.iocs["Ransom Note"].add(p)
 
             # ---- Ransomware extension (Hard-ish IOC)
