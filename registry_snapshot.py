@@ -398,6 +398,25 @@ def _find_persistence_entry(key_path):
     return _PERSISTENCE_KEY_LOOKUP.get(parent)
 
 
+def strip_curated_keys(snapshot):
+    """
+    drops any key already covered by the curated PERSISTENCE_KEYS
+    list from a snapshot_registry_subtree()-shaped dict, using the
+    same exact/parent match _find_persistence_entry uses.
+
+    a curated key can sit inside one of RegistryWatcher's broad
+    catch-all roots (e.g. the Run key lives inside HKCU\\Software).
+    without this, a change there gets reported twice: once by the
+    curated snapshot_registry()/diff_registry() pass, and again by
+    the broad root's own diff against the same unfiltered data.
+    """
+    return {
+        key: values
+        for key, values in snapshot.items()
+        if _find_persistence_entry(key) is None
+    }
+
+
 def classify_registry_event(raw_event, emit):
     """
     build forensic-grade behavior evidence from a curated,

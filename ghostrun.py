@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from sender_http import PutEvidenceSender
 from network_watch import NetworkCapture, CAPTURE_ACTIVITY_EVENTS
 from process_mon import ProcessMonitor
-from registry_snapshot import snapshot_registry, snapshot_registry_subtree, diff_registry
+from registry_snapshot import snapshot_registry, snapshot_registry_subtree, diff_registry, strip_curated_keys
 from registry_watch import RegistryWatcher
 from persistence_detector import PersistenceDetector
 from detector_network_inference import NetworkInferenceDetector
@@ -385,9 +385,16 @@ def main():
     # curated PERSISTENCE_KEYS list
     # still surfaces the raw change and, where applicable,
     # execution_reference_detected
+    # strip_curated_keys() drops anything the curated diff_registry call above
+    # already reported (a curated key, e.g. the Run key, can sit inside one
+    # of these broad roots), so it isn't reported twice
     for hive, path in sorted(triggered_roots):
         broad_root_after = snapshot_registry_subtree(hive, path)
-        diff_registry(broad_root_before[(hive, path)], broad_root_after, emit, ROOTPID)
+        diff_registry(
+            strip_curated_keys(broad_root_before[(hive, path)]),
+            strip_curated_keys(broad_root_after),
+            emit, ROOTPID,
+        )
 
     print(f"[GhostRun] Filesystem watcher (PID {ROOTPID}): STOP")
     fs_watcher.stop()
