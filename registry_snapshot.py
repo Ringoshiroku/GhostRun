@@ -142,7 +142,17 @@ def _enum_subkeys(key):
             name = winreg.EnumKey(key, i)
         except OSError:
             break
-        subkeys.append((name, winreg.OpenKey(key, name)))
+        try:
+            sub_key = winreg.OpenKey(key, name)
+        except OSError:
+            # EnumKey lists a subkey's name without needing the permission that
+            # opening it actually requires.
+            # a specific subkey (e.g. one owned by an AppContainer SID) can
+            # legitimately deny that even from an elevated process.
+            # skip it, don't let it crash the whole walk.
+            i += 1
+            continue
+        subkeys.append((name, sub_key))
         i += 1
     return subkeys
 
