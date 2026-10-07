@@ -190,6 +190,43 @@ _ATTRIBUTION_NOTE = (
 )
 
 
+# known malware mutex-name classification
+
+# curated, extensible list, same shape as registry_snapshot.py's PERSISTENCE_KEYS
+# prefix-matched, not substring-anywhere, keeps false positives narrow
+# since some of these prefixes are short
+# each prefix is verified against real analyzed samples, not general reputation
+# njRAT, NanoCore, and NetWire were checked and excluded on purpose:
+# they use per-build random/GUID mutex names with no stable prefix
+# a signature list can't catch that class, only families with a static watermark
+MUTEX_SIGNATURES = [
+    {"family": "DarkComet", "confidence": "high", "prefixes": ["DC_MUTEX-"]},
+    {"family": "QuasarRAT", "confidence": "medium", "prefixes": ["QSR_MUTEX_"]},
+    {"family": "Remcos", "confidence": "medium",
+     "prefixes": ["Rmc-", "Remcos_Mutex_Inj", "remcos_", "Remcos-",
+                  "Mutex_RemWatchdog", "MARE_IS_BEAUTIFUL_EX"]},
+]
+
+
+def classify_mutex_event(name, emit, pid=None):
+    """
+    checks a newly-created mutex's name against MUTEX_SIGNATURES.
+    emits at most one known_malware_mutex event (first matching family
+    wins). most mutex names won't match anything, that's expected, not
+    a failure.
+    """
+    for sig in MUTEX_SIGNATURES:
+        for prefix in sig["prefixes"]:
+            if name.startswith(prefix):
+                emit(
+                    category="mutex_behavior",
+                    event="known_malware_mutex",
+                    confidence=sig["confidence"],
+                    data={"pid": pid, "family": sig["family"], "mutex": name, "attck": "T1480.001"},
+                )
+                return
+
+
 class MutexMonitor:
     def __init__(self, emit_func, poll_interval=5, root_pid=None, baseline=None):
         self.emit = emit_func
@@ -229,6 +266,7 @@ class MutexMonitor:
             if source is not None:
                 data["directory"] = source
             self.emit("mutex", "mutex_created", data)
+            classify_mutex_event(name, self.emit, pid=self.root_pid)
         self._baseline = current
 
     def run(self):
