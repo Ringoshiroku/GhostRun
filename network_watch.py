@@ -4,12 +4,36 @@ import shutil
 import socket
 import subprocess
 
-TELEGRAM_IP_RANGES = [
-    ("149.154.0.0", "149.154.255.255"),
-    ("91.108.0.0", "91.108.255.255"),
+# curated, extensible list of known legitimate services often abused for
+# C2/exfil, same shape as registry_snapshot.py's PERSISTENCE_KEYS.
+# domain matching is the reliable signal: SNI reflects the hostname the
+# client actually asked for, regardless of how the connection is routed
+# (e.g. through a sinkhole/proxy). ip_ranges/ip_prefixes are real signal
+# too, but only observable against the service's genuine infrastructure.
+# no port check here: a tls_connection event already means Suricata's own
+# content-based protocol detection identified this as TLS, independent of
+# port, the same technique FakeNet-NG's taste() uses. re-gating on
+# port==443 would just miss a sample using a non-standard port.
+KNOWN_SERVICE_SIGNATURES = [
+    {"service": "Discord", "domain_confidence": "high",
+     "domains": ["discord.com", "discordapp.com", "discord.gg", "gateway.discord.gg"],
+     "ip_confidence": "medium", "ip_prefixes": ["162.159.", "104.16.", "104.17."]},
+    {"service": "Telegram", "domain_confidence": "high",
+     "domains": ["telegram.org", "t.me", "api.telegram.org"],
+     "ip_confidence": "medium",
+     "ip_ranges": [("149.154.0.0", "149.154.255.255"), ("91.108.0.0", "91.108.255.255")]},
+    {"service": "Pastebin", "domain_confidence": "medium",
+     "domains": ["pastebin.com", "hastebin.com", "paste.ee"]},
+    {"service": "GitHub", "domain_confidence": "medium",
+     "domains": ["raw.githubusercontent.com", "gist.githubusercontent.com", "gist.github.com"]},
+    {"service": "Dropbox/Cloud Storage", "domain_confidence": "medium",
+     "domains": ["dropboxapi.com", "dropboxusercontent.com", "drive.google.com",
+                 "docs.google.com", "onedrive.live.com", "graph.microsoft.com"]},
+    {"service": "Slack/Teams Webhook", "domain_confidence": "medium",
+     "domains": ["hooks.slack.com", "webhook.office.com"]},
+    {"service": "Imgur", "domain_confidence": "low",
+     "domains": ["imgur.com", "i.imgur.com"]},
 ]
-DISCORD_DOMAINS = ["discord.com", "discordapp.com", "discord.gg", "gateway.discord.gg"]
-DISCORD_IP_PREFIX = ["162.159.", "104.16.", "104.17."]
 
 
 def ip_to_int(ip):
@@ -27,19 +51,23 @@ def ip_in_range(ip, start, end):
 
 
 def infer_service(domain_hits, remote_ip, remote_port):
-    if remote_port == 443:
-        for start, end in TELEGRAM_IP_RANGES:
-            if ip_in_range(remote_ip, start, end):
-                return {"service": "Telegram", "confidence": "medium", "domains": list(domain_hits)}
+    domain_hits_l = [d.lower() for d in domain_hits]
+    for sig in KNOWN_SERVICE_SIGNATURES:
+        for d in domain_hits_l:
+            for domain_sig in sig.get("domains", []):
+                if domain_sig in d:
+                    return {"service": sig["service"], "confidence": sig["domain_confidence"],
+                            "domains": list(domain_hits)}
 
-    for d in domain_hits:
-        for sig in DISCORD_DOMAINS:
-            if sig in d.lower():
-                return {"service": "Discord", "confidence": "high", "domains": list(domain_hits)}
+        for start, end in sig.get("ip_ranges", []):
+            if remote_ip and ip_in_range(remote_ip, start, end):
+                return {"service": sig["service"], "confidence": sig["ip_confidence"],
+                        "domains": list(domain_hits)}
 
-    for prefix in DISCORD_IP_PREFIX:
-        if remote_ip and remote_ip.startswith(prefix) and remote_port == 443:
-            return {"service": "Discord", "confidence": "medium", "domains": list(domain_hits)}
+        for prefix in sig.get("ip_prefixes", []):
+            if remote_ip and remote_ip.startswith(prefix):
+                return {"service": sig["service"], "confidence": sig["ip_confidence"],
+                        "domains": list(domain_hits)}
 
     return None
 
@@ -158,15 +186,26 @@ def emit_network_evidence(events, emit_func, root_pid=None):
             service_info = infer_service({event["sni"]} if event["sni"] else set(), event["dest_ip"], event["dest_port"])
             if service_info:
                 data.update(service_info)
+            elif not event["sni"]:
+                # no SNI at all means the client connected straight to an IP literal, not
+                # a hostname. uncommon for ordinary browser/application traffic, so it's a
+                # weak, generic indicator on its own, not a named service match.
+                data["raw_ip_literal"] = True
             emit_func("network_behavior", "tls_connection", data)
         elif event["event_type"] == "http":
-            emit_func("network_behavior", "http_request", {
+            data = {
                 "src_ip": event["src_ip"],
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "hostname": event["hostname"],
                 "url": event["url"], "user_agent": event["user_agent"],
                 "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
-            })
+            }
+            service_info = infer_service(
+                {event["hostname"]} if event["hostname"] else set(), event["dest_ip"], event["dest_port"],
+            )
+            if service_info:
+                data.update(service_info)
+            emit_func("network_behavior", "http_request", data)
         elif event["event_type"] == "flow":
             emit_func("network_behavior", "flow_summary", {
                 "src_ip": event["src_ip"],

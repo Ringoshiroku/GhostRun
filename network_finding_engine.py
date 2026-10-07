@@ -1,5 +1,32 @@
 from network_watch import CAPTURE_CONNECTION_EVENTS
 
+# same idea as timeline_builder.py's SYSTEM_PATH_KEYWORDS/is_system_noise,
+# but for network destinations instead of filesystem paths.
+# filters out routine OS telemetry/update/certificate-check traffic so it
+# doesn't become a malware_network_activity finding.
+# this matters more here because every network_behavior event is
+# capture-derived and stamped with root_pid no matter which process
+# actually made the connection. see _PID_ATTRIBUTION_NOTE in
+# network_watch.py.
+# the pid-attribution filter below can't tell sample traffic from
+# background OS noise by itself, so without this filter every telemetry
+# connection in the analysis window would look like it came from the sample.
+KNOWN_BENIGN_DOMAINS = [
+    "windowsupdate.com", "update.microsoft.com", "download.windowsupdate.com",
+    "ctldl.windowsupdate.com", "delivery.mp.microsoft.com",
+    "settings-win.data.microsoft.com", "vortex.data.microsoft.com",
+    "time.windows.com", "time.nist.gov",
+    "ocsp.digicert.com", "ocsp.comodoca.com", "ocsp.sectigo.com",
+    "crl.microsoft.com",
+]
+
+
+def _is_known_benign(hostname):
+    if not hostname:
+        return False
+    h = hostname.lower()
+    return any(sig in h for sig in KNOWN_BENIGN_DOMAINS)
+
 
 class NetworkFindingEngine:
     def __init__(self, root_pid, process_monitor):
@@ -37,6 +64,9 @@ class NetworkFindingEngine:
         dest_port = data.get("dest_port")
         raddr = f"{dest_ip}:{dest_port}" if dest_ip and dest_port else dest_ip
         hostname = data.get("sni") or data.get("hostname") or data.get("query_name")
+
+        if _is_known_benign(hostname):
+            return
 
         key = (raddr, hostname, data.get("url"))
         if key in self._seen:
