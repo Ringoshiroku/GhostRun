@@ -3,6 +3,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 
 # curated, extensible list of known legitimate services often abused for
 # C2/exfil, same shape as registry_snapshot.py's PERSISTENCE_KEYS.
@@ -124,6 +125,17 @@ def parse_eve_line(line):
         })
         return base
 
+    if event_type == "alert":
+        alert = raw.get("alert", {})
+        base.update({
+            "signature": alert.get("signature"),
+            "category": alert.get("category"),
+            "severity": alert.get("severity"),
+            "signature_id": alert.get("signature_id"),
+            "gid": alert.get("gid"),
+        })
+        return base
+
     return None
 
 
@@ -147,10 +159,10 @@ def parse_eve_file(path):
 # downstream detectors use this list instead of hardcoding event names, so
 # renaming an event here can't silently break them.
 CAPTURE_ACTIVITY_EVENTS = frozenset({
-    "dns_query", "tls_connection", "http_request", "flow_summary",
+    "dns_query", "tls_connection", "http_request", "flow_summary", "ids_alert",
 })
 CAPTURE_CONNECTION_EVENTS = frozenset({
-    "tls_connection", "http_request", "flow_summary",
+    "tls_connection", "http_request", "flow_summary", "ids_alert",
 })
 
 
@@ -214,11 +226,68 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "pkts_toserver": event["pkts_toserver"], "pkts_toclient": event["pkts_toclient"],
                 "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
+        elif event["event_type"] == "alert":
+            emit_func("network_behavior", "ids_alert", {
+                "src_ip": event["src_ip"],
+                "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
+                "signature": event["signature"], "category": event["category"],
+                "severity": event["severity"], "signature_id": event["signature_id"],
+                "gid": event["gid"],
+                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
+            })
+
+
+_DEFAULT_SURICATA_RULES_PATH = "/var/lib/suricata/rules/suricata.rules"
+
+
+def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SURICATA_RULES_PATH,
+                                  interactive=None):
+    """
+    finds a Suricata rules file to load, so capture gets real
+    signature-based alerting (the Emerging Threats Open ruleset, free and
+    BSD-licensed) instead of just protocol parsing.
+    order: an explicit configured path, then whatever suricata-update
+    already left on this system, then, only if interactive, offer to fetch
+    it now via suricata-update.
+    returns None (never raises) if nothing is available or the user says
+    no, same degrade-gracefully pattern as every other optional tool here:
+    capture still runs, just without rules.
+    """
+    if configured_path and os.path.exists(configured_path):
+        return configured_path
+
+    if os.path.exists(default_path):
+        return default_path
+
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    if not interactive:
+        return None
+
+    if not shutil.which("suricata-update"):
+        return None
+
+    answer = input(
+        "No Suricata rules found. Fetch the free Emerging Threats Open "
+        "ruleset now via suricata-update? [y/N] "
+    ).strip().lower()
+    if answer != "y":
+        return None
+
+    try:
+        subprocess.run(
+            ["suricata-update", "-o", os.path.dirname(default_path)],
+            check=True, timeout=300,
+        )
+    except Exception:
+        return None
+
+    return default_path if os.path.exists(default_path) else None
 
 
 class NetworkCapture:
     def __init__(self, pcap_path, eve_log_dir, emit_func, sslkeylogfile_path=None, root_pid=None,
-                 exclude_host=None, exclude_port=None):
+                 exclude_host=None, exclude_port=None, rules_path=None):
         self.pcap_path = pcap_path
         self.eve_log_dir = eve_log_dir
         self.emit = emit_func
@@ -230,6 +299,7 @@ class NetworkCapture:
         # like any other traffic.
         self.exclude_host = exclude_host
         self.exclude_port = exclude_port
+        self.rules_path = rules_path
         self._proc = None
         self._tools_available = bool(shutil.which("dumpcap")) and bool(shutil.which("suricata"))
 
@@ -281,12 +351,17 @@ class NetworkCapture:
         if self.sslkeylogfile_path:
             env["SSLKEYLOGFILE"] = self.sslkeylogfile_path
 
+        cmd = [
+            "suricata", "-r", self.pcap_path, "-l", self.eve_log_dir, "-k", "none",
+            "--set", "app-layer.protocols.tls.ja3-fingerprints=yes",
+            "--set", "app-layer.protocols.tls.ja4-fingerprints=yes",
+        ]
+        resolved_rules_path = self.rules_path or _resolve_suricata_rules_path()
+        if resolved_rules_path:
+            cmd += ["-S", resolved_rules_path]
+
         result = subprocess.run(
-            [
-                "suricata", "-r", self.pcap_path, "-l", self.eve_log_dir, "-k", "none",
-                "--set", "app-layer.protocols.tls.ja3-fingerprints=yes",
-                "--set", "app-layer.protocols.tls.ja4-fingerprints=yes",
-            ],
+            cmd,
             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=120,
         )
 

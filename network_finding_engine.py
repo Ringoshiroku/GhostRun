@@ -87,13 +87,22 @@ class NetworkFindingEngine:
             "hostname": hostname,
             "url": data.get("url"),
             "service": data.get("service"),
+            "signature": data.get("signature"),
+            "category": data.get("category"),
+            "severity": data.get("severity"),
         })
 
     def analyze(self, emit):
         for f in list(self.findings):
+            if f.get("event") == "ids_alert":
+                confidence = "high"
+            elif f.get("service"):
+                confidence = "medium"
+            else:
+                confidence = "low"
             emit(
                 category="network_behavior",
                 event="malware_network_activity",
                 data=f,
-                confidence="medium" if f.get("service") else "low"
+                confidence=confidence,
             )
