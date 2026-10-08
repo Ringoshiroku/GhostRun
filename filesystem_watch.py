@@ -6,7 +6,7 @@ from collections import defaultdict
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
-from yara_scan import YaraScanError, resolve_yara_rules_dir, scan_file
+from yara_scan import YaraScanError, match_rules
 
 
 def hash_file(path, size_cap_bytes=100_000_000):
@@ -126,10 +126,19 @@ class _Handler(FileSystemEventHandler):
 
 
 class FilesystemWatcher:
-    def __init__(self, targets, emit_func, debounce_seconds=1.5, size_cap_bytes=100_000_000, root_pid=None):
+    def __init__(self, targets, emit_func, debounce_seconds=1.5, size_cap_bytes=100_000_000, root_pid=None,
+                 yara_rules=None):
         self.targets = targets
         self.emit = emit_func
         self.root_pid = root_pid
+        # an already-compiled yara.Rules object (yara_scan.load_yara_rules),
+        # resolved and compiled by the caller before the sample launches.
+        # never done here: resolving can prompt and git clone, and
+        # compiling a large ruleset takes seconds, neither of which
+        # belongs mid-detonation or per dropped file. None means no YARA
+        # scanning this run. shared read-only across the debounce timer
+        # threads, which yara.Rules.match() supports.
+        self.yara_rules = yara_rules
         self._observer = Observer()
 
         self.hasher = DebouncedHasher(
@@ -138,16 +147,6 @@ class FilesystemWatcher:
             size_cap_bytes=size_cap_bytes,
         )
         self.rename_tracker = RenameExtensionTracker(on_ransomware_pattern=self._on_ransomware_pattern)
-
-        # lazy, cached rules-dir resolution: resolved on the first scan
-        # attempt, not here, so an interactive fetch prompt, if any,
-        # only ever appears once per run, not once per dropped file.
-        # locked because watchdog's debounce timers settle on separate
-        # threads, so several dropped files can hit the first scan
-        # attempt at the same time.
-        self._yara_rules_dir = None
-        self._yara_rules_resolved = False
-        self._yara_lock = threading.Lock()
 
         handler = _Handler(self, self.emit, self.hasher, self.rename_tracker, self.root_pid)
 
@@ -240,25 +239,14 @@ class FilesystemWatcher:
                 "pid": self.root_pid, "root": self._root_for_path(path),
             })
 
-    def _resolve_yara_rules_dir_once(self):
-        with self._yara_lock:
-            if not self._yara_rules_resolved:
-                self._yara_rules_dir = resolve_yara_rules_dir()
-                self._yara_rules_resolved = True
-            return self._yara_rules_dir
-
     def _scan_and_emit_yara_matches(self, path):
-        rules_dir = self._resolve_yara_rules_dir_once()
-        if rules_dir is None:
+        if self.yara_rules is None:
             return
         try:
-            matches = scan_file(path, rules_dir)
-        except (YaraScanError, OSError, ImportError):
-            # ImportError means yara-python isn't installed. scan_file's
-            # `import yara` is deferred inside the function so this module
-            # stays importable without it, so that failure shows up here,
-            # not at import time. must degrade like every other
-            # optional-tool-missing case, not crash monitoring.
+            matches = match_rules(self.yara_rules, path)
+        except (YaraScanError, OSError):
+            # e.g. a self-deleting dropper removed the file between
+            # settling and this scan. must not crash monitoring.
             return
         for match in matches:
             self.emit("filesystem_behavior", "yara_match", {

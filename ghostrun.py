@@ -17,6 +17,7 @@ from persistence_detector import PersistenceDetector
 from detector_network_inference import NetworkInferenceDetector
 from detector_static_network import StaticNetworkIndicatorDetector
 from filesystem_watch import FilesystemWatcher
+from yara_scan import load_yara_rules
 from persistence_watch import PersistenceWatcher
 from mutex_watch import MutexMonitor, list_all_named_objects
 from timeline_builder import TimelineBuilder
@@ -219,6 +220,18 @@ def main():
     )
     print("[GhostRun] HTTP PUT EvidenceSender ready")
 
+    # yara rules for scanning dropped files: resolved and compiled exactly
+    # once here, before any baseline, before network capture starts, and
+    # before the sample launches
+    # resolution can prompt interactively and git clone the community ruleset;
+    # doing that later would put the prompt mid-run, eat into the analysis
+    # timeout, and put the clone's own github.com traffic in the
+    # pcap/suricata capture (and its process activity after the baselines)
+    # where it would look indistinguishable from the sample's
+    # compiling once here also means each dropped file is only matched,
+    # never recompiled
+    yara_rules = load_yara_rules()
+
 
     # -----------------------------------------------------
     # 2️⃣ Snapshot BEFORE
@@ -327,7 +340,7 @@ def main():
     # that's a fast-follow for filesystem_watch.py, out of scope here since
     # that file is already reviewed and approved
     # accepted limitation for now, not an oversight
-    fs_watcher = FilesystemWatcher(targets=FS_TARGETS, emit_func=emit, root_pid=ROOTPID)
+    fs_watcher = FilesystemWatcher(targets=FS_TARGETS, emit_func=emit, root_pid=ROOTPID, yara_rules=yara_rules)
     fs_watcher.start()
 
     # Process monitor
