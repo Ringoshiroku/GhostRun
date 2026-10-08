@@ -247,13 +247,25 @@ def emit_network_evidence(events, emit_func, root_pid=None):
 _DEFAULT_SURICATA_RULES_PATH = os.path.expanduser("~/.ghostrun/rules/suricata/suricata.rules")
 
 
+# suricata-update has no __main__.py: `python -m suricata.update` fails
+# with "'suricata.update' is a package and cannot be directly executed",
+# confirmed against its real source. so -m can't reach it.
+# its own installed console script (bin/suricata-update upstream) is a
+# thin wrapper doing the same import-and-call. verified this reproduces
+# the real CLI, including a correct `--version` response.
+_SURICATA_UPDATE_MODULE_INVOCATION = (
+    "from suricata.update import main; import sys; sys.exit(main.main())"
+)
+
+
 def _find_suricata_update_command():
     """
     finds how to run suricata-update on this machine.
-    prefers the bare command if it's on PATH, else falls back to
-    `python -m suricata.update`, since a pip install can succeed while the
-    installed console-script entry point still isn't on PATH (same issue
-    dumpcap/suricata hit during manual setup earlier).
+    prefers the bare command if it's on PATH, else falls back to directly
+    importing and calling its entry point via `python -c`, since a pip
+    install can succeed while the installed console-script entry point
+    still isn't on PATH (same issue dumpcap/suricata hit during manual
+    setup earlier).
     returns None (never raises) if neither works.
     """
     if shutil.which("suricata-update"):
@@ -261,12 +273,12 @@ def _find_suricata_update_command():
 
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "suricata.update", "--version"],
+            [sys.executable, "-c", _SURICATA_UPDATE_MODULE_INVOCATION, "--version"],
             capture_output=True, timeout=10,
         )
     except Exception:
         return None
-    return [sys.executable, "-m", "suricata.update"] if result.returncode == 0 else None
+    return [sys.executable, "-c", _SURICATA_UPDATE_MODULE_INVOCATION] if result.returncode == 0 else None
 
 
 def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SURICATA_RULES_PATH,
