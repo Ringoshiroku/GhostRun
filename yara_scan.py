@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+import sys
 import warnings
 
 
@@ -7,6 +11,8 @@ class YaraScanError(Exception):
 
 _MIN_MATCH_LENGTH = 4
 _MAX_INSTANCES_PER_IDENTIFIER = 20
+_DEFAULT_YARA_RULES_CACHE = os.path.expanduser("~/.ghostrun/rules/yara-rules")
+_DEFAULT_YARA_RULES_URL = "https://github.com/Yara-Rules/rules"
 
 
 def _is_unreadable(text):
@@ -94,3 +100,51 @@ def scan_file(file_path, rules_dir):
         results.append({"rule": match.rule, "tags": list(match.tags), "matches": flattened})
 
     return results
+
+
+def resolve_yara_rules_dir(configured_path=None, cache_dir=None, interactive=None):
+    """
+    finds a YARA rules directory to scan with.
+    checks, in order: an explicit path, then a populated local cache
+    dir, then, if interactive, offers to clone the default ruleset
+    (Yara-Rules/rules, same one watson uses) via git.
+    returns None and never raises if nothing is available or the user
+    says no. monitoring still runs, just without YARA scanning.
+    """
+    if cache_dir is None:
+        cache_dir = _DEFAULT_YARA_RULES_CACHE
+
+    if configured_path and os.path.isdir(configured_path):
+        return configured_path
+
+    if os.path.isdir(cache_dir) and os.listdir(cache_dir):
+        return cache_dir
+
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    if not interactive:
+        return None
+
+    if not shutil.which("git"):
+        return None
+
+    answer = input(
+        f"No YARA rules found. Fetch the community ruleset now via "
+        f"'git clone {_DEFAULT_YARA_RULES_URL}'? [y/N] "
+    ).strip().lower()
+    if answer != "y":
+        return None
+
+    try:
+        os.makedirs(os.path.dirname(cache_dir), exist_ok=True)
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", "--progress", _DEFAULT_YARA_RULES_URL, cache_dir],
+            timeout=300,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    return cache_dir if os.path.isdir(cache_dir) and os.listdir(cache_dir) else None
