@@ -22,6 +22,7 @@ from persistence_watch import PersistenceWatcher
 from mutex_watch import MutexMonitor, list_all_named_objects
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
+from process_termination import kill_process_tree
 import atexit
 import signal
 
@@ -118,6 +119,16 @@ def on_exit():
         time.sleep(0.5)  # beri waktu sender kirim
     except:
         pass
+
+    # safety net: on_exit() is already registered for atexit, SIGINT, and
+    # SIGTERM below
+    # together those cover normal completion, an uncaught exception out of
+    # main(), and the analyst interrupting the run
+    # so this is the one place that reliably runs across all three, without
+    # a separate try/finally wrapper
+    # idempotent and safe even if the primary post-timeout kill (see section
+    # 5 below) already handled it, a no-op in that case
+    kill_process_tree(pid, emit, trigger="on_exit")
         
 def sender_worker():
     while True:
@@ -375,12 +386,38 @@ def main():
     )
     mutex_thread.start()
 
+    # hang backstop: if the main thread never reaches the primary post-timeout
+    # kill above (e.g. stuck inside a blocking call in one of the teardown
+    # steps below, with nothing to raise it out), this is the only one of
+    # the three kill call sites that can still save the run
+    # it runs on its own independent timer instead of depending on the main
+    # thread's own progress
+    # the 60s grace buffer covers the slowest observed teardown step
+    # (suricata's offline pcap analysis) plus the three 5s monitor-thread
+    # joins later in main()
+    # idempotent: a no-op if the primary kill (or on_exit) already handled
+    # it, which is the normal, expected outcome
+    def _watchdog():
+        time.sleep(args.timeout + 60)
+        kill_process_tree(ROOTPID, emit, trigger="watchdog_hang")
+
+    watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
+    watchdog_thread.start()
+
     print("[GhostRun] Monitoring started")
     
     # -----------------------------------------------------
     # 5️⃣ Run until timeout
     # -----------------------------------------------------
     time.sleep(args.timeout)
+
+    # force-terminate the sample's full process tree now, before taking any
+    # AFTER snapshot or starting teardown
+    # otherwise the sample keeps running (and possibly still mutating
+    # registry/mutex state) during the several-second teardown sequence below
+    # and the AFTER snapshots would reflect some arbitrary mid-teardown moment
+    # instead of the genuinely final state
+    kill_process_tree(ROOTPID, emit, trigger="timeout")
 
     # -----------------------------------------------------
     # 6️⃣ Snapshot AFTER
