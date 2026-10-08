@@ -6,6 +6,8 @@ from collections import defaultdict
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
+from yara_scan import YaraScanError, resolve_yara_rules_dir, scan_file
+
 
 def hash_file(path, size_cap_bytes=100_000_000):
     try:
@@ -137,6 +139,16 @@ class FilesystemWatcher:
         )
         self.rename_tracker = RenameExtensionTracker(on_ransomware_pattern=self._on_ransomware_pattern)
 
+        # lazy, cached rules-dir resolution: resolved on the first scan
+        # attempt, not here, so an interactive fetch prompt, if any,
+        # only ever appears once per run, not once per dropped file.
+        # locked because watchdog's debounce timers settle on separate
+        # threads, so several dropped files can hit the first scan
+        # attempt at the same time.
+        self._yara_rules_dir = None
+        self._yara_rules_resolved = False
+        self._yara_lock = threading.Lock()
+
         handler = _Handler(self, self.emit, self.hasher, self.rename_tracker, self.root_pid)
 
         # watchdog's recursive=True already covers everything under a
@@ -207,6 +219,7 @@ class FilesystemWatcher:
                 "path": path, "sha256": digest, "pid": self.root_pid,
                 "root": self._root_for_path(path),
             })
+            self._scan_and_emit_yara_matches(path)
             return
 
         # hash_file returns None both for a missing/unreadable file and
@@ -225,6 +238,32 @@ class FilesystemWatcher:
             self.emit("filesystem_behavior", "file_content_hashed", {
                 "path": path, "sha256": None, "reason": "size_cap_exceeded",
                 "pid": self.root_pid, "root": self._root_for_path(path),
+            })
+
+    def _resolve_yara_rules_dir_once(self):
+        with self._yara_lock:
+            if not self._yara_rules_resolved:
+                self._yara_rules_dir = resolve_yara_rules_dir()
+                self._yara_rules_resolved = True
+            return self._yara_rules_dir
+
+    def _scan_and_emit_yara_matches(self, path):
+        rules_dir = self._resolve_yara_rules_dir_once()
+        if rules_dir is None:
+            return
+        try:
+            matches = scan_file(path, rules_dir)
+        except (YaraScanError, OSError, ImportError):
+            # ImportError means yara-python isn't installed. scan_file's
+            # `import yara` is deferred inside the function so this module
+            # stays importable without it, so that failure shows up here,
+            # not at import time. must degrade like every other
+            # optional-tool-missing case, not crash monitoring.
+            return
+        for match in matches:
+            self.emit("filesystem_behavior", "yara_match", {
+                "path": path, "rule": match["rule"], "tags": match["tags"],
+                "matches": match["matches"], "pid": self.root_pid,
             })
 
     def _on_ransomware_pattern(self, old_ext, new_ext, count):
