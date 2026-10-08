@@ -237,7 +237,36 @@ def emit_network_evidence(events, emit_func, root_pid=None):
             })
 
 
-_DEFAULT_SURICATA_RULES_PATH = "/var/lib/suricata/rules/suricata.rules"
+# suricata-update's own source hardcodes /var/lib/suricata as its default
+# output dir on every platform, with no Windows-aware branch at all, so
+# that default isn't worth keeping here. GhostRun already overrides the
+# output path via -o regardless, so the default is ours to choose.
+# uses the same ~/.ghostrun/ convention _DEFAULT_YARA_RULES_CACHE already
+# uses, so it resolves to a real, writable, native path on every platform
+# GhostRun runs on.
+_DEFAULT_SURICATA_RULES_PATH = os.path.expanduser("~/.ghostrun/rules/suricata/suricata.rules")
+
+
+def _find_suricata_update_command():
+    """
+    finds how to run suricata-update on this machine.
+    prefers the bare command if it's on PATH, else falls back to
+    `python -m suricata.update`, since a pip install can succeed while the
+    installed console-script entry point still isn't on PATH (same issue
+    dumpcap/suricata hit during manual setup earlier).
+    returns None (never raises) if neither works.
+    """
+    if shutil.which("suricata-update"):
+        return ["suricata-update"]
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "suricata.update", "--version"],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        return None
+    return [sys.executable, "-m", "suricata.update"] if result.returncode == 0 else None
 
 
 def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SURICATA_RULES_PATH,
@@ -264,7 +293,8 @@ def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SUR
     if not interactive:
         return None
 
-    if not shutil.which("suricata-update"):
+    cmd = _find_suricata_update_command()
+    if cmd is None:
         return None
 
     answer = input(
@@ -275,8 +305,9 @@ def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SUR
         return None
 
     try:
+        os.makedirs(os.path.dirname(default_path), exist_ok=True)
         subprocess.run(
-            ["suricata-update", "-o", os.path.dirname(default_path)],
+            cmd + ["-o", os.path.dirname(default_path)],
             check=True, timeout=300,
         )
     except Exception:
