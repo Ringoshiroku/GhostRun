@@ -394,6 +394,14 @@ class NetworkCapture:
         if self.sslkeylogfile_path:
             env["SSLKEYLOGFILE"] = self.sslkeylogfile_path
 
+        # Suricata's eve-log defaults to append mode across runs, and eve_log_dir
+        # is just dirname(the run's output file). so two runs sharing an output
+        # directory would share eve.json, and a stale alert from an earlier run
+        # could get silently re-emitted and misattributed to this run's PID.
+        eve_path = os.path.join(self.eve_log_dir, "eve.json")
+        if os.path.exists(eve_path):
+            os.remove(eve_path)
+
         cmd = [
             "suricata", "-r", self.pcap_path, "-l", self.eve_log_dir, "-k", "none",
             "--set", "app-layer.protocols.tls.ja3-fingerprints=yes",
@@ -416,6 +424,5 @@ class NetworkCapture:
             })
             return
 
-        eve_path = os.path.join(self.eve_log_dir, "eve.json")
         if os.path.exists(eve_path):
             emit_network_evidence(parse_eve_file(eve_path), self.emit, root_pid=self.root_pid)
