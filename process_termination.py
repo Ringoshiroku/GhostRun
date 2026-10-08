@@ -29,11 +29,12 @@ def kill_process_tree(pid, emit_func=None, trigger=None):
     procs = list(children) + [root]
 
     failed_pids = []
+    already_gone_pids = set()
     for proc in procs:
         try:
             proc.kill()
         except psutil.NoSuchProcess:
-            continue
+            already_gone_pids.add(proc.pid)
         except psutil.AccessDenied:
             failed_pids.append(proc.pid)
         except Exception:
@@ -45,9 +46,13 @@ def kill_process_tree(pid, emit_func=None, trigger=None):
         gone, alive = [], procs
 
     failed_pid_set = set(failed_pids)
-    killed_pids = [p.pid for p in gone if p.pid not in failed_pid_set]
+    killed_pids = [
+        p.pid
+        for p in gone
+        if p.pid not in failed_pid_set and p.pid not in already_gone_pids
+    ]
     for proc in alive:
-        if proc.pid not in failed_pid_set:
+        if proc.pid not in failed_pid_set and proc.pid not in already_gone_pids:
             failed_pids.append(proc.pid)
 
     if not killed_pids and not failed_pids:
@@ -59,13 +64,16 @@ def kill_process_tree(pid, emit_func=None, trigger=None):
 def _emit(emit_func, pid, trigger, killed_pids, failed_pids):
     if emit_func is None:
         return
-    emit_func(
-        category="execution",
-        event="sample_force_terminated",
-        data={
-            "pid": pid,
-            "trigger": trigger,
-            "killed_pids": killed_pids,
-            "failed_pids": failed_pids,
-        },
-    )
+    try:
+        emit_func(
+            category="execution",
+            event="sample_force_terminated",
+            data={
+                "pid": pid,
+                "trigger": trigger,
+                "killed_pids": killed_pids,
+                "failed_pids": failed_pids,
+            },
+        )
+    except Exception:
+        pass
