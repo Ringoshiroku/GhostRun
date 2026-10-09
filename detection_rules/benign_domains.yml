@@ -1,0 +1,20 @@
+# hostnames suppressed as known-benign noise.
+# this matters more here than elsewhere: every network_behavior event
+# is capture-derived and stamped with the sample's root_pid,
+# regardless of which process actually made the connection.
+# so without this, every routine OS telemetry, update, or
+# certificate-check connection seen during the analysis window
+# would be reported as if the sample made it.
+- windowsupdate.com
+- update.microsoft.com
+- download.windowsupdate.com
+- ctldl.windowsupdate.com
+- delivery.mp.microsoft.com
+- settings-win.data.microsoft.com
+- vortex.data.microsoft.com
+- time.windows.com
+- time.nist.gov
+- ocsp.digicert.com
+- ocsp.comodoca.com
+- ocsp.sectigo.com
+- crl.microsoft.com

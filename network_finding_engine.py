@@ -1,4 +1,5 @@
 from network_watch import CAPTURE_CONNECTION_EVENTS
+from rules_loader import load_rule_file
 
 # same idea as timeline_builder.py's SYSTEM_PATH_KEYWORDS/is_system_noise,
 # but for network destinations instead of filesystem paths.
@@ -11,14 +12,7 @@ from network_watch import CAPTURE_CONNECTION_EVENTS
 # the pid-attribution filter below can't tell sample traffic from
 # background OS noise by itself, so without this filter every telemetry
 # connection in the analysis window would look like it came from the sample.
-KNOWN_BENIGN_DOMAINS = [
-    "windowsupdate.com", "update.microsoft.com", "download.windowsupdate.com",
-    "ctldl.windowsupdate.com", "delivery.mp.microsoft.com",
-    "settings-win.data.microsoft.com", "vortex.data.microsoft.com",
-    "time.windows.com", "time.nist.gov",
-    "ocsp.digicert.com", "ocsp.comodoca.com", "ocsp.sectigo.com",
-    "crl.microsoft.com",
-]
+KNOWN_BENIGN_DOMAINS = load_rule_file("benign_domains.yml")
 
 
 def _is_known_benign(hostname):
