@@ -12,7 +12,13 @@ from rules_loader import load_rule_file
 # the pid-attribution filter below can't tell sample traffic from
 # background OS noise by itself, so without this filter every telemetry
 # connection in the analysis window would look like it came from the sample.
-KNOWN_BENIGN_DOMAINS = load_rule_file("benign_domains.yml")
+def _validate_benign_domain_entry(entry):
+    if not isinstance(entry, str) or not entry.strip():
+        return "entry must be a non-empty hostname string"
+    return None
+
+
+KNOWN_BENIGN_DOMAINS = load_rule_file("benign_domains.yml", validate_entry=_validate_benign_domain_entry)
 
 
 def _is_known_benign(hostname):

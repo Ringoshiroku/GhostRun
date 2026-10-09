@@ -201,9 +201,19 @@ _ATTRIBUTION_NOTE = (
 # njRAT, NanoCore, and NetWire were checked and excluded on purpose:
 # they use per-build random/GUID mutex names with no stable prefix
 # a signature list can't catch that class, only families with a static watermark
+def _validate_mutex_signature_entry(entry):
+    prefixes = entry.get("prefixes")
+    if not isinstance(prefixes, list) or not prefixes:
+        return "'prefixes' must be a non-empty list"
+    if not all(isinstance(p, str) and p for p in prefixes):
+        return "'prefixes' must contain only non-empty strings"
+    return None
+
+
 MUTEX_SIGNATURES = load_rule_file(
     "mutex_signatures.yml",
     required_fields=["family", "confidence", "prefixes"],
+    validate_entry=_validate_mutex_signature_entry,
 )
 
 

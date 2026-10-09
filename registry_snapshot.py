@@ -25,9 +25,18 @@ _MODE_CONDITIONAL_FIELDS = {
     "subkey_child_values": "watch_subkeys",
 }
 
+# hardcoded instead of derived from _MODE_READERS.keys().
+# _MODE_READERS is defined later in this file, down in the SNAPSHOT
+# section, after PERSISTENCE_KEYS is loaded.
+# _validate_persistence_key_entry runs from that load at import time,
+# so _MODE_READERS wouldn't exist yet.
+_KNOWN_MODES = frozenset({"values", "subkey_values", "subkey_presence", "subkey_child_values"})
+
 
 def _validate_persistence_key_entry(entry):
     mode = entry.get("mode")
+    if mode not in _KNOWN_MODES:
+        return f"unrecognized mode '{mode}'"
     required = _MODE_CONDITIONAL_FIELDS.get(mode)
     if required and required not in entry:
         return f"mode '{mode}' requires '{required}'"

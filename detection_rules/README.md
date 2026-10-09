@@ -1,9 +1,9 @@
 # GhostRun detection rules
 
 Each file here holds one category of GhostRun's own detection data, as
-plain YAML. Edit these directly, no code changes needed: a typo in one
-file only disables that file's own detection for the run (printed as a
-warning on startup), it won't crash GhostRun or affect the other files.
+plain YAML. Edit these directly, no code changes needed: a syntax error
+disables that file; a malformed entry is skipped on its own; either way
+a warning is printed and GhostRun keeps running.
 
 - `mutex_signatures.yml`: known malware family mutex-name patterns (e.g. DarkComet, QuasarRAT, Remcos)
 - `network_service_signatures.yml`: known legitimate services (Discord, Telegram, etc.), recognized by domain/IP, used to label C2/exfil-capable traffic

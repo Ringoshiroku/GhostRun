@@ -1,3 +1,4 @@
+import ipaddress
 import json
 import os
 import shutil
@@ -17,9 +18,43 @@ from rules_loader import load_rule_file
 # content-based protocol detection identified this as TLS, independent of
 # port, the same technique FakeNet-NG's taste() uses. re-gating on
 # port==443 would just miss a sample using a non-standard port.
+def _validate_network_service_signature_entry(entry):
+    domains = entry.get("domains")
+    if domains is not None and (
+        not isinstance(domains, list) or not all(isinstance(d, str) for d in domains)
+    ):
+        return "'domains' must be a list of strings"
+
+    has_ip_signal = "ip_ranges" in entry or "ip_prefixes" in entry
+    if has_ip_signal and "ip_confidence" not in entry:
+        return "'ip_confidence' is required when 'ip_ranges' or 'ip_prefixes' is present"
+
+    ip_ranges = entry.get("ip_ranges")
+    if ip_ranges is not None:
+        if not isinstance(ip_ranges, list):
+            return "'ip_ranges' must be a list"
+        for r in ip_ranges:
+            if not (isinstance(r, list) and len(r) == 2 and all(isinstance(x, str) for x in r)):
+                return "each 'ip_ranges' entry must be a 2-element list of IP strings"
+            try:
+                ipaddress.IPv4Address(r[0])
+                ipaddress.IPv4Address(r[1])
+            except ValueError:
+                return "each 'ip_ranges' entry must contain valid IPv4 addresses"
+
+    ip_prefixes = entry.get("ip_prefixes")
+    if ip_prefixes is not None and (
+        not isinstance(ip_prefixes, list) or not all(isinstance(p, str) for p in ip_prefixes)
+    ):
+        return "'ip_prefixes' must be a list of strings"
+
+    return None
+
+
 KNOWN_SERVICE_SIGNATURES = load_rule_file(
     "network_service_signatures.yml",
     required_fields=["service", "domain_confidence", "domains"],
+    validate_entry=_validate_network_service_signature_entry,
 )
 
 
