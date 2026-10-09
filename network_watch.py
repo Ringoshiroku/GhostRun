@@ -19,18 +19,23 @@ from rules_loader import load_rule_file
 # port, the same technique FakeNet-NG's taste() uses. re-gating on
 # port==443 would just miss a sample using a non-standard port.
 def _validate_network_service_signature_entry(entry):
+    # checked unconditionally, not gated on "is not None": domains is a
+    # required_fields key, so it's always present by now.
+    # ip_ranges/ip_prefixes are genuinely optional, so they're gated on key
+    # *presence* (`"x" in entry`), not on the value being non-None. an entry
+    # can have the key present with an explicit YAML `null` value, which
+    # `is not None` would wrongly read as "absent, nothing to check" and let
+    # it fall straight through to infer_service's unguarded iteration.
     domains = entry.get("domains")
-    if domains is not None and (
-        not isinstance(domains, list) or not all(isinstance(d, str) for d in domains)
-    ):
+    if not isinstance(domains, list) or not all(isinstance(d, str) for d in domains):
         return "'domains' must be a list of strings"
 
     has_ip_signal = "ip_ranges" in entry or "ip_prefixes" in entry
     if has_ip_signal and "ip_confidence" not in entry:
         return "'ip_confidence' is required when 'ip_ranges' or 'ip_prefixes' is present"
 
-    ip_ranges = entry.get("ip_ranges")
-    if ip_ranges is not None:
+    if "ip_ranges" in entry:
+        ip_ranges = entry["ip_ranges"]
         if not isinstance(ip_ranges, list):
             return "'ip_ranges' must be a list"
         for r in ip_ranges:
@@ -42,11 +47,10 @@ def _validate_network_service_signature_entry(entry):
             except ValueError:
                 return "each 'ip_ranges' entry must contain valid IPv4 addresses"
 
-    ip_prefixes = entry.get("ip_prefixes")
-    if ip_prefixes is not None and (
-        not isinstance(ip_prefixes, list) or not all(isinstance(p, str) for p in ip_prefixes)
-    ):
-        return "'ip_prefixes' must be a list of strings"
+    if "ip_prefixes" in entry:
+        ip_prefixes = entry["ip_prefixes"]
+        if not isinstance(ip_prefixes, list) or not all(isinstance(p, str) for p in ip_prefixes):
+            return "'ip_prefixes' must be a list of strings"
 
     return None
 

@@ -21,10 +21,12 @@ def load_rule_file(filename, required_fields=None, validate_entry=None):
     every degrade path prints a warning naming the file and the
     specific problem.
 
-    when neither required_fields nor validate_entry is given,
-    entries may be plain scalars (e.g. a flat list of hostname
-    strings) and are returned as-is. with either one given, a
-    non-mapping entry is skipped.
+    required_fields, when given, requires entries to be mappings,
+    so a non-mapping entry is skipped before validate_entry ever
+    sees it. without required_fields, entries may be plain
+    scalars (e.g. a flat list of hostname strings), and
+    validate_entry, if given, runs on every entry regardless of
+    its type, so it can reject a malformed scalar too.
     """
     path = os.path.join(_RULES_DIR, filename)
 
