@@ -5,6 +5,8 @@ import socket
 import subprocess
 import sys
 
+from rules_loader import load_rule_file
+
 # curated, extensible list of known legitimate services often abused for
 # C2/exfil, same shape as registry_snapshot.py's PERSISTENCE_KEYS.
 # domain matching is the reliable signal: SNI reflects the hostname the
@@ -15,26 +17,10 @@ import sys
 # content-based protocol detection identified this as TLS, independent of
 # port, the same technique FakeNet-NG's taste() uses. re-gating on
 # port==443 would just miss a sample using a non-standard port.
-KNOWN_SERVICE_SIGNATURES = [
-    {"service": "Discord", "domain_confidence": "high",
-     "domains": ["discord.com", "discordapp.com", "discord.gg", "gateway.discord.gg"],
-     "ip_confidence": "medium", "ip_prefixes": ["162.159.", "104.16.", "104.17."]},
-    {"service": "Telegram", "domain_confidence": "high",
-     "domains": ["telegram.org", "t.me", "api.telegram.org"],
-     "ip_confidence": "medium",
-     "ip_ranges": [("149.154.0.0", "149.154.255.255"), ("91.108.0.0", "91.108.255.255")]},
-    {"service": "Pastebin", "domain_confidence": "medium",
-     "domains": ["pastebin.com", "hastebin.com", "paste.ee"]},
-    {"service": "GitHub", "domain_confidence": "medium",
-     "domains": ["raw.githubusercontent.com", "gist.githubusercontent.com", "gist.github.com"]},
-    {"service": "Dropbox/Cloud Storage", "domain_confidence": "medium",
-     "domains": ["dropboxapi.com", "dropboxusercontent.com", "drive.google.com",
-                 "docs.google.com", "onedrive.live.com", "graph.microsoft.com"]},
-    {"service": "Slack/Teams Webhook", "domain_confidence": "medium",
-     "domains": ["hooks.slack.com", "webhook.office.com"]},
-    {"service": "Imgur", "domain_confidence": "low",
-     "domains": ["imgur.com", "i.imgur.com"]},
-]
+KNOWN_SERVICE_SIGNATURES = load_rule_file(
+    "network_service_signatures.yml",
+    required_fields=["service", "domain_confidence", "domains"],
+)
 
 
 def ip_to_int(ip):

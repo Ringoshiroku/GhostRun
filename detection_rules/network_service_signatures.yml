@@ -1,0 +1,53 @@
+- service: Discord
+  domain_confidence: high
+  domains:
+    - discord.com
+    - discordapp.com
+    - discord.gg
+    - gateway.discord.gg
+  ip_confidence: medium
+  ip_prefixes:
+    - "162.159."
+    - "104.16."
+    - "104.17."
+- service: Telegram
+  domain_confidence: high
+  domains:
+    - telegram.org
+    - t.me
+    - api.telegram.org
+  ip_confidence: medium
+  ip_ranges:
+    - ["149.154.0.0", "149.154.255.255"]
+    - ["91.108.0.0", "91.108.255.255"]
+- service: Pastebin
+  domain_confidence: medium
+  domains:
+    - pastebin.com
+    - hastebin.com
+    - paste.ee
+- service: GitHub
+  domain_confidence: medium
+  domains:
+    - raw.githubusercontent.com
+    - gist.githubusercontent.com
+    - gist.github.com
+- service: Dropbox/Cloud Storage
+  domain_confidence: medium
+  domains:
+    - dropboxapi.com
+    - dropboxusercontent.com
+    - drive.google.com
+    - docs.google.com
+    - onedrive.live.com
+    - graph.microsoft.com
+- service: Slack/Teams Webhook
+  domain_confidence: medium
+  domains:
+    - hooks.slack.com
+    - webhook.office.com
+- service: Imgur
+  domain_confidence: low
+  domains:
+    - imgur.com
+    - i.imgur.com
