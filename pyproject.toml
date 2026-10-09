@@ -8,6 +8,7 @@ dependencies = [
     "wmi; sys_platform == 'win32'",
     "watchdog",
     "yara-python",
+    "pyyaml",
 ]
 
 [project.optional-dependencies]
