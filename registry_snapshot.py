@@ -1,6 +1,8 @@
 import sys
 import re
 
+from rules_loader import load_rule_file
+
 if sys.platform == "win32":
     import winreg
     _HIVE_MAP = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
@@ -13,90 +15,30 @@ else:
 # persistence monitoring
 # =========================================================
 
-PERSISTENCE_KEYS = [
-    # --- Run / RunOnce (T1547.001) ---
-    {"hive": "HKCU", "path": r"Software\Microsoft\Windows\CurrentVersion\Run",
-     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
-    {"hive": "HKCU", "path": r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
-     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
-    {"hive": "HKLM", "path": r"Software\Microsoft\Windows\CurrentVersion\Run",
-     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
-    {"hive": "HKLM", "path": r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
-     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
-    {"hive": "HKLM", "path": r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
-     "mode": "values", "category": "run_key", "attck": "T1547.001", "confidence": "high"},
+# subkey_values and subkey_child_values modes each need their own
+# extra field (watch_values / watch_subkeys).
+# required_fields alone can't express a conditional requirement like
+# that, so this file's loader call also passes a validate_entry hook
+# just for that.
+_MODE_CONDITIONAL_FIELDS = {
+    "subkey_values": "watch_values",
+    "subkey_child_values": "watch_subkeys",
+}
 
-    # --- Winlogon Shell/Userinit (T1547.004) ---
-    {"hive": "HKLM", "path": r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon",
-     "mode": "values", "watch_values": ["Shell", "Userinit"],
-     "category": "winlogon", "attck": "T1547.004", "confidence": "high"},
 
-    # --- Image File Execution Options debugger hijack (T1546.012) ---
-    {"hive": "HKLM",
-     "path": r"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
-     "mode": "subkey_values", "watch_values": ["Debugger"],
-     "category": "ifeo_debugger", "attck": "T1546.012", "confidence": "high"},
+def _validate_persistence_key_entry(entry):
+    mode = entry.get("mode")
+    required = _MODE_CONDITIONAL_FIELDS.get(mode)
+    if required and required not in entry:
+        return f"mode '{mode}' requires '{required}'"
+    return None
 
-    # --- AppInit_DLLs (T1546.010) ---
-    {"hive": "HKLM", "path": r"Software\Microsoft\Windows NT\CurrentVersion\Windows",
-     "mode": "values", "watch_values": ["AppInit_DLLs", "LoadAppInit_DLLs"],
-     "category": "appinit_dlls", "attck": "T1546.010", "confidence": "high"},
 
-    # --- Services (T1543.003) ---
-    {"hive": "HKLM", "path": r"SYSTEM\CurrentControlSet\Services",
-     "mode": "subkey_values", "watch_values": ["ImagePath", "Start", "Type"],
-     "category": "new_service", "attck": "T1543.003", "confidence": "high"},
-
-    # --- Scheduled Tasks (T1053.005) ---
-    {"hive": "HKLM",
-     "path": r"Software\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree",
-     "mode": "subkey_presence", "category": "scheduled_task",
-     "attck": "T1053.005", "confidence": "medium"},
-
-    # --- LSA Security/Authentication Packages (T1547.005) ---
-    {"hive": "HKLM", "path": r"SYSTEM\CurrentControlSet\Control\Lsa",
-     "mode": "values",
-     "watch_values": ["Authentication Packages", "Security Packages", "Notification Packages"],
-     "category": "lsa_packages", "attck": "T1547.005", "confidence": "high"},
-
-    # --- Browser Helper Objects (T1185 adjacent, tracked as execution persistence) ---
-    {"hive": "HKLM",
-     "path": r"Software\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects",
-     "mode": "subkey_presence", "category": "browser_helper_object",
-     "attck": "T1547", "confidence": "medium"},
-
-    # --- Desktop Wallpaper Defacement (T1491.001) ---
-    {"hive": "HKCU", "path": r"Control Panel\Desktop",
-     "mode": "values", "watch_values": ["Wallpaper", "TranscodedImageCache"],
-     "category": "desktop_defacement", "attck": "T1491.001", "confidence": "medium"},
-
-    # --- COM/CLSID hijack (T1546.015): the hijacked value sits on
-    # CLSID\{guid}\InprocServer32 or \LocalServer32's default value, one
-    # level below the CLSID subkeys this walks. scoped to HKCU, the
-    # common variant that doesn't need admin rights (HKLM's CLSID tree is
-    # much bigger and needs elevation to write to). ---
-    {"hive": "HKCU", "path": r"Software\Classes\CLSID",
-     "mode": "subkey_child_values", "watch_subkeys": ["InprocServer32", "LocalServer32"],
-     "category": "com_hijack", "attck": "T1546.015", "confidence": "high"},
-
-    # --- file association hijack via shell\open\command (T1546.001
-    # adjacent): "*" is the fallback handler for every file type, so a
-    # hijack there runs on any file open; exefile covers .exe launches
-    # specifically. ---
-    {"hive": "HKCU", "path": r"Software\Classes\*\shell\open\command",
-     "mode": "values", "category": "file_assoc_hijack", "attck": "T1546.001", "confidence": "high"},
-    {"hive": "HKCU", "path": r"Software\Classes\exefile\shell\open\command",
-     "mode": "values", "category": "file_assoc_hijack", "attck": "T1546.001", "confidence": "high"},
-
-    # --- environment variable persistence (T1574.012 adjacent, e.g.
-    # COR_PROFILER .NET profiler hijacking, or UserInitMprLogonScript) ---
-    {"hive": "HKCU", "path": r"Environment",
-     "mode": "values", "category": "environment_persistence", "attck": "T1574.012", "confidence": "medium"},
-
-    # --- Control Panel\Personalization tampering ---
-    {"hive": "HKCU", "path": r"Control Panel\Personalization",
-     "mode": "values", "category": "personalization_tamper", "attck": "T1491.001", "confidence": "low"},
-]
+PERSISTENCE_KEYS = load_rule_file(
+    "registry_persistence_keys.yml",
+    required_fields=["hive", "path", "mode", "category", "attck", "confidence"],
+    validate_entry=_validate_persistence_key_entry,
+)
 
 
 # =========================================================
