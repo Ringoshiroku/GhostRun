@@ -1,0 +1,21 @@
+# malware family mutex-name signatures.
+# a mutex the sample creates is checked against each family's
+# `prefixes`. if the mutex name starts with any listed prefix,
+# it's flagged as that family.
+- family: DarkComet
+  confidence: high
+  prefixes:
+    - "DC_MUTEX-"
+- family: QuasarRAT
+  confidence: medium
+  prefixes:
+    - "QSR_MUTEX_"
+- family: Remcos
+  confidence: medium
+  prefixes:
+    - "Rmc-"
+    - "Remcos_Mutex_Inj"
+    - "remcos_"
+    - "Remcos-"
+    - "Mutex_RemWatchdog"
+    - "MARE_IS_BEAUTIFUL_EX"

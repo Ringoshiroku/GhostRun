@@ -3,6 +3,8 @@ import os
 import time
 from ctypes import wintypes
 
+from rules_loader import load_rule_file
+
 
 def diff_mutexes(before, after):
     return sorted(
@@ -199,13 +201,10 @@ _ATTRIBUTION_NOTE = (
 # njRAT, NanoCore, and NetWire were checked and excluded on purpose:
 # they use per-build random/GUID mutex names with no stable prefix
 # a signature list can't catch that class, only families with a static watermark
-MUTEX_SIGNATURES = [
-    {"family": "DarkComet", "confidence": "high", "prefixes": ["DC_MUTEX-"]},
-    {"family": "QuasarRAT", "confidence": "medium", "prefixes": ["QSR_MUTEX_"]},
-    {"family": "Remcos", "confidence": "medium",
-     "prefixes": ["Rmc-", "Remcos_Mutex_Inj", "remcos_", "Remcos-",
-                  "Mutex_RemWatchdog", "MARE_IS_BEAUTIFUL_EX"]},
-]
+MUTEX_SIGNATURES = load_rule_file(
+    "mutex_signatures.yml",
+    required_fields=["family", "confidence", "prefixes"],
+)
 
 
 def classify_mutex_event(name, emit, pid=None):
