@@ -26,13 +26,13 @@ def load_rule_file(filename, required_fields=None, validate_entry=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
             raw = f.read()
-    except OSError as e:
+    except Exception as e:
         print(f"[GhostRun] WARNING: could not read rule file {filename}: {e}")
         return []
 
     try:
         parsed = yaml.safe_load(raw)
-    except yaml.YAMLError as e:
+    except Exception as e:
         print(f"[GhostRun] WARNING: {filename} is not valid YAML: {e}")
         return []
 
