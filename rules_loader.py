@@ -20,6 +20,11 @@ def load_rule_file(filename, required_fields=None, validate_entry=None):
 
     every degrade path prints a warning naming the file and the
     specific problem.
+
+    when neither required_fields nor validate_entry is given,
+    entries may be plain scalars (e.g. a flat list of hostname
+    strings) and are returned as-is. with either one given, a
+    non-mapping entry is skipped.
     """
     path = os.path.join(_RULES_DIR, filename)
 
@@ -48,24 +53,30 @@ def load_rule_file(filename, required_fields=None, validate_entry=None):
 
     validated = []
     for i, entry in enumerate(parsed):
-        if not isinstance(entry, dict):
+        if isinstance(entry, dict):
+            if required_fields:
+                missing = [f for f in required_fields if f not in entry]
+                if missing:
+                    print(
+                        f"[GhostRun] WARNING: {filename} entry {i} is missing "
+                        f"required field(s) {missing}, skipping it"
+                    )
+                    continue
+
+            if validate_entry is not None:
+                error = validate_entry(entry)
+                if error:
+                    print(f"[GhostRun] WARNING: {filename} entry {i}: {error}, skipping it")
+                    continue
+
+        elif required_fields or validate_entry is not None:
+            # a non-dict entry can't satisfy either structural check,
+            # so it's only ok when the caller didn't ask for either.
+            # omitting both is how a caller says "this file's entries
+            # are plain scalars, not mappings" (e.g. benign_domains.yml's
+            # flat list of hostname strings).
             print(f"[GhostRun] WARNING: {filename} entry {i} is not a mapping, skipping it")
             continue
-
-        if required_fields:
-            missing = [f for f in required_fields if f not in entry]
-            if missing:
-                print(
-                    f"[GhostRun] WARNING: {filename} entry {i} is missing "
-                    f"required field(s) {missing}, skipping it"
-                )
-                continue
-
-        if validate_entry is not None:
-            error = validate_entry(entry)
-            if error:
-                print(f"[GhostRun] WARNING: {filename} entry {i}: {error}, skipping it")
-                continue
 
         validated.append(entry)
 
