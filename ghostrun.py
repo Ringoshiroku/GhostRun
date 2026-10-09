@@ -40,7 +40,8 @@ network_finding = None
 MALWARE_IDENTITY = {
     "pid": None,
     "path": None,
-    "name": None
+    "name": None,
+    "create_time": None
 }
 
 MALWARE_PIDS = set()
@@ -128,7 +129,20 @@ def on_exit():
     # a separate try/finally wrapper
     # idempotent and safe even if the primary post-timeout kill (see section
     # 5 below) already handled it, a no-op in that case
-    kill_process_tree(pid, emit, trigger="on_exit")
+    #
+    # by this point the kill happens well after sample launch, so the
+    # original Popen handle may be gone and the os may have reused this pid
+    # for an unrelated process
+    # expected_create_time guards against killing that unrelated process by
+    # mistake
+    # the evidence pipeline may already be shut down or never started (e.g.
+    # on an uncaught exception before any dump), so a failure here is
+    # printed synchronously, it's the only chance to see it
+    _, failed_pids = kill_process_tree(
+        pid, emit, trigger="on_exit", expected_create_time=MALWARE_IDENTITY.get("create_time")
+    )
+    if failed_pids:
+        print(f"[GhostRun] WARNING: failed to confirm termination of PID(s) {failed_pids} on exit")
         
 def sender_worker():
     while True:
@@ -312,10 +326,20 @@ def main():
         MALWARE_PIDS.add(ROOTPID)
         net_capture.root_pid = ROOTPID
 
+        # captured now, right after launch, while the Popen handle is still
+        # guaranteed to be pinned to this pid
+        # the delayed kill call sites (on_exit, watchdog) use this to detect pid
+        # reuse before acting
+        try:
+            _root_create_time = psutil.Process(ROOTPID).create_time()
+        except Exception:
+            _root_create_time = None
+
         MALWARE_IDENTITY.update({
             "pid": ROOTPID,
             "path": args.sample,
-            "name": os.path.basename(args.sample)
+            "name": os.path.basename(args.sample),
+            "create_time": _root_create_time
         })
 
         print(f"[GhostRun] Sample executed (PID {ROOTPID})")
@@ -386,20 +410,29 @@ def main():
     )
     mutex_thread.start()
 
-    # hang backstop: if the main thread never reaches the primary post-timeout
-    # kill above (e.g. stuck inside a blocking call in one of the teardown
-    # steps below, with nothing to raise it out), this is the only one of
-    # the three kill call sites that can still save the run
+    # safety-net retry: the primary post-timeout kill below runs right after
+    # time.sleep(args.timeout), before any teardown step that could actually
+    # hang, so it always runs before this watchdog does
+    # this is a second, delayed retry, useful if something from the primary
+    # kill is still alive 60s later (e.g. an AccessDenied survivor)
     # it runs on its own independent timer instead of depending on the main
     # thread's own progress
     # the 60s grace buffer covers the slowest observed teardown step
     # (suricata's offline pcap analysis) plus the three 5s monitor-thread
     # joins later in main()
-    # idempotent: a no-op if the primary kill (or on_exit) already handled
-    # it, which is the normal, expected outcome
+    # idempotent: a no-op if the primary kill (or on_exit) already fully
+    # handled it, the expected outcome on every normal run
+    # like on_exit, this fires well after sample launch, and after the
+    # primary kill may have already reaped the process, so it also guards
+    # against pid reuse via expected_create_time, and prints its own
+    # failure synchronously since nothing else will surface it
     def _watchdog():
         time.sleep(args.timeout + 60)
-        kill_process_tree(ROOTPID, emit, trigger="watchdog_hang")
+        _, failed_pids = kill_process_tree(
+            ROOTPID, emit, trigger="watchdog_retry", expected_create_time=MALWARE_IDENTITY.get("create_time")
+        )
+        if failed_pids:
+            print(f"[GhostRun] WARNING: failed to confirm termination of PID(s) {failed_pids} on watchdog retry")
 
     watchdog_thread = threading.Thread(target=_watchdog, daemon=True)
     watchdog_thread.start()
@@ -417,7 +450,7 @@ def main():
     # registry/mutex state) during the several-second teardown sequence below
     # and the AFTER snapshots would reflect some arbitrary mid-teardown moment
     # instead of the genuinely final state
-    kill_process_tree(ROOTPID, emit, trigger="timeout")
+    kill_process_tree(ROOTPID, emit, trigger="timeout", expected_create_time=MALWARE_IDENTITY.get("create_time"))
 
     # -----------------------------------------------------
     # 6️⃣ Snapshot AFTER
