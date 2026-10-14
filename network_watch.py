@@ -5,6 +5,7 @@ import shutil
 import socket
 import subprocess
 import sys
+from datetime import datetime
 
 from rules_loader import load_rule_file
 
@@ -111,8 +112,10 @@ def parse_eve_line(line):
     base = {
         "event_type": event_type,
         "src_ip": raw.get("src_ip"),
+        "src_port": raw.get("src_port"),
         "dest_ip": raw.get("dest_ip"),
         "dest_port": raw.get("dest_port"),
+        "timestamp": raw.get("timestamp"),
     }
 
     if event_type == "dns":
@@ -203,14 +206,63 @@ _PID_ATTRIBUTION_NOTE = (
 )
 
 
-def emit_network_evidence(events, emit_func, root_pid=None):
+def _parse_suricata_timestamp(raw):
+    """
+    Suricata's real eve.json timestamps have no colon in the UTC offset
+    (e.g. "2023-09-18T06:13:41.532140+0000"), per Suricata's own
+    eve-json-format docs, which also note older versions omit the offset
+    entirely ("2009-11-24T21:27:09.534255").
+    Python's datetime.fromisoformat() needs a colon in the offset on this
+    project's 3.10 floor, so one is inserted before parsing if missing.
+    returns a float epoch timestamp, or None if raw is missing or
+    unparseable in either form.
+    """
+    if not raw:
+        return None
+    s = raw
+    if len(s) >= 5 and s[-5] in "+-" and s[-4:].isdigit():
+        s = s[:-2] + ":" + s[-2:]
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
+def _resolve_attributed_pid(event, connection_monitor, procmon, root_pid):
+    """
+    finds the specific descendant process a captured flow belongs to,
+    falling back to root_pid when that's not possible: no monitor/procmon
+    wired in, no parseable timestamp, neither src_port nor dest_port found
+    in any ConnectionMonitor snapshot, or the resolved PID isn't actually a
+    descendant of root_pid (e.g. the port got reused by an unrelated
+    process).
+    checks src_port then dest_port instead of picking one by event
+    direction: only one of the two is ever a real local port a process on
+    this machine could hold, the other is the remote side's port and won't
+    appear in the local snapshot table at all.
+    """
+    if connection_monitor is None or procmon is None:
+        return root_pid
+    ts = _parse_suricata_timestamp(event.get("timestamp"))
+    if ts is None:
+        return root_pid
+    for port in (event.get("src_port"), event.get("dest_port")):
+        if port is None:
+            continue
+        candidate = connection_monitor.resolve_pid(port, ts)
+        if candidate is not None and procmon.is_descendant(candidate, root_pid):
+            return candidate
+    return root_pid
+
+
+def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=None, procmon=None):
     for event in events:
         if event["event_type"] == "dns":
             emit_func("network_behavior", "dns_query", {
                 "query_name": event["query_name"], "query_type": event["query_type"],
                 "src_ip": event["src_ip"], "dest_ip": event["dest_ip"],
                 "dest_port": event["dest_port"],
-                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
         elif event["event_type"] == "tls":
             data = {
@@ -218,7 +270,7 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "sni": event["sni"],
                 "ja3_pivot": {"ja3": event["ja3"], "ja3s": event["ja3s"], "note": _JA3_PIVOT_NOTE},
-                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
             }
             service_info = infer_service({event["sni"]} if event["sni"] else set(), event["dest_ip"], event["dest_port"])
             if service_info:
@@ -235,7 +287,7 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "hostname": event["hostname"],
                 "url": event["url"], "user_agent": event["user_agent"],
-                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
             }
             service_info = infer_service(
                 {event["hostname"]} if event["hostname"] else set(), event["dest_ip"], event["dest_port"],
@@ -249,7 +301,7 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "start": event["start"], "end": event["end"],
                 "pkts_toserver": event["pkts_toserver"], "pkts_toclient": event["pkts_toclient"],
-                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
         elif event["event_type"] == "alert":
             emit_func("network_behavior", "ids_alert", {
@@ -258,7 +310,7 @@ def emit_network_evidence(events, emit_func, root_pid=None):
                 "signature": event["signature"], "category": event["category"],
                 "severity": event["severity"], "signature_id": event["signature_id"],
                 "gid": event["gid"],
-                "pid": root_pid, "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
             })
 
 
