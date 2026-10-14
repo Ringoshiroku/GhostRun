@@ -205,6 +205,11 @@ _PID_ATTRIBUTION_NOTE = (
     "capture-derived; stamped with the analysis root PID, not per-process attributed"
 )
 
+_RESOLVED_PID_NOTE = (
+    "resolved via connection-table correlation to this specific "
+    "descendant process, not the capture-wide analysis root PID"
+)
+
 
 def _parse_suricata_timestamp(raw):
     """
@@ -234,45 +239,52 @@ def _parse_suricata_timestamp(raw):
         # otherwise silently assumes local time (per Python's own docs), which
         # would be off by the host's UTC offset on any non-UTC sandbox host and
         # quietly corrupt the whole attribution chain's time comparisons.
+        # NOTE: assumes Suricata's older no-offset format means UTC, not local
+        # time. not confirmed against a real captured eve.json or the Suricata
+        # source. modern Suricata always includes an explicit offset, so this is
+        # a low-impact edge case, but check it during live verification (see the
+        # plan's Task 3 Step 8) against whatever Suricata build is actually used.
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
 
 
-def _resolve_attributed_pid(event, connection_monitor, procmon, root_pid):
+def _resolve_attributed_pid(event, connection_monitor, root_pid):
     """
-    finds the specific descendant process a captured flow belongs to,
-    falling back to root_pid when that's not possible: no monitor/procmon
-    wired in, no parseable timestamp, neither src_port nor dest_port found
-    in any ConnectionMonitor snapshot, or the resolved PID isn't actually a
-    descendant of root_pid (e.g. the port got reused by an unrelated
-    process).
-    checks src_port then dest_port instead of picking one by event
-    direction: only one of the two is ever a real local port a process on
-    this machine could hold, the other is the remote side's port and won't
-    appear in the local snapshot table at all.
+    finds which process a captured flow most likely belongs to.
+    returns (pid, resolved): resolved is True when a specific PID was
+    found, whether or not it's actually a sample descendant, that's no
+    longer this function's job to decide. emit()'s own MALWARE_PIDS-based
+    noise filter (ghostrun.py) decides whether that PID's evidence
+    actually survives, same mechanism every other evidence category here
+    already uses.
+    resolved is False when nothing could be determined at all (no monitor
+    wired in, no parseable timestamp, neither port found in any
+    snapshot), in which case pid falls back to root_pid.
     """
-    if connection_monitor is None or procmon is None:
-        return root_pid
+    if connection_monitor is None:
+        return root_pid, False
     ts = _parse_suricata_timestamp(event.get("timestamp"))
     if ts is None:
-        return root_pid
+        return root_pid, False
     for port in (event.get("src_port"), event.get("dest_port")):
         if port is None:
             continue
         candidate = connection_monitor.resolve_pid(port, ts)
-        if candidate is not None and procmon.is_descendant(candidate, root_pid):
-            return candidate
-    return root_pid
+        if candidate is not None:
+            return candidate, True
+    return root_pid, False
 
 
-def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=None, procmon=None):
+def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=None):
     for event in events:
+        pid, resolved = _resolve_attributed_pid(event, connection_monitor, root_pid)
+        note = _RESOLVED_PID_NOTE if resolved else _PID_ATTRIBUTION_NOTE
         if event["event_type"] == "dns":
             emit_func("network_behavior", "dns_query", {
                 "query_name": event["query_name"], "query_type": event["query_type"],
                 "src_ip": event["src_ip"], "dest_ip": event["dest_ip"],
                 "dest_port": event["dest_port"],
-                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": pid, "pid_attribution": note,
             })
         elif event["event_type"] == "tls":
             data = {
@@ -280,7 +292,7 @@ def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=N
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "sni": event["sni"],
                 "ja3_pivot": {"ja3": event["ja3"], "ja3s": event["ja3s"], "note": _JA3_PIVOT_NOTE},
-                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": pid, "pid_attribution": note,
             }
             service_info = infer_service({event["sni"]} if event["sni"] else set(), event["dest_ip"], event["dest_port"])
             if service_info:
@@ -297,7 +309,7 @@ def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=N
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "hostname": event["hostname"],
                 "url": event["url"], "user_agent": event["user_agent"],
-                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": pid, "pid_attribution": note,
             }
             service_info = infer_service(
                 {event["hostname"]} if event["hostname"] else set(), event["dest_ip"], event["dest_port"],
@@ -311,7 +323,7 @@ def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=N
                 "dest_ip": event["dest_ip"], "dest_port": event["dest_port"],
                 "start": event["start"], "end": event["end"],
                 "pkts_toserver": event["pkts_toserver"], "pkts_toclient": event["pkts_toclient"],
-                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": pid, "pid_attribution": note,
             })
         elif event["event_type"] == "alert":
             emit_func("network_behavior", "ids_alert", {
@@ -320,7 +332,7 @@ def emit_network_evidence(events, emit_func, root_pid=None, connection_monitor=N
                 "signature": event["signature"], "category": event["category"],
                 "severity": event["severity"], "signature_id": event["signature_id"],
                 "gid": event["gid"],
-                "pid": _resolve_attributed_pid(event, connection_monitor, procmon, root_pid), "pid_attribution": _PID_ATTRIBUTION_NOTE,
+                "pid": pid, "pid_attribution": note,
             })
 
 
@@ -418,7 +430,7 @@ def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SUR
 class NetworkCapture:
     def __init__(self, pcap_path, eve_log_dir, emit_func, sslkeylogfile_path=None, root_pid=None,
                  exclude_host=None, exclude_port=None, rules_path=None,
-                 connection_monitor=None, procmon=None):
+                 connection_monitor=None):
         self.pcap_path = pcap_path
         self.eve_log_dir = eve_log_dir
         self.emit = emit_func
@@ -431,10 +443,9 @@ class NetworkCapture:
         self.exclude_host = exclude_host
         self.exclude_port = exclude_port
         self.rules_path = rules_path
-        # both None by default (built before the sample launches, same as
-        # root_pid). patched in live once available, see ghostrun.py.
+        # None by default (built before the sample launches, same as root_pid).
+        # patched in live once available, see ghostrun.py.
         self.connection_monitor = connection_monitor
-        self.procmon = procmon
         self._proc = None
         self._tools_available = bool(shutil.which("dumpcap")) and bool(shutil.which("suricata"))
 
@@ -519,5 +530,5 @@ class NetworkCapture:
         if os.path.exists(eve_path):
             emit_network_evidence(
                 parse_eve_file(eve_path), self.emit, root_pid=self.root_pid,
-                connection_monitor=self.connection_monitor, procmon=self.procmon,
+                connection_monitor=self.connection_monitor,
             )

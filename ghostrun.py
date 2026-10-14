@@ -387,9 +387,9 @@ def main():
     # Process monitor
     proc_monitor = ProcessMonitor(
         root_pid=proc.pid,
-        emit_func=emit
+        emit_func=emit,
+        malware_pids=MALWARE_PIDS,
     )
-    net_capture.procmon = proc_monitor
 
     network_finding = NetworkFindingEngine(
         root_pid=proc.pid,

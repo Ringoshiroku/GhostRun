@@ -116,21 +116,35 @@ def _connect_wmi():
 
 
 class ProcessMonitor:
-    def __init__(self, root_pid, emit_func):
+    def __init__(self, root_pid, emit_func, malware_pids=None):
         self.root_pid = root_pid
         self.emit = emit_func
         self.running = True
 
         self.parent_map = {}
+        # shared mutable set, same object as ghostrun.py's MALWARE_PIDS global
+        # passed by reference, not copied
+        # grows as this monitor discovers real descendants
+        # that's what lets emit()'s noise filter correctly accept network evidence
+        # for a child process instead of dropping it
+        self.malware_pids = malware_pids if malware_pids is not None else set()
 
     def is_descendant(self, pid, root_pid):
         """
-        Check if pid is descendant of root_pid
+        check if pid is a descendant of root_pid.
+        guards against a cycle in parent_map (e.g. pid reuse making
+        parent_map[a]=b and parent_map[b]=a), which would otherwise loop forever.
+        needed because this now gets called with arbitrary system-wide pids from
+        the network-attribution path, not just ones already known safe.
         """
         current = pid
+        visited = set()
         while current:
             if current == root_pid:
                 return True
+            if current in visited:
+                return False
+            visited.add(current)
             current = self.parent_map.get(current)
         return False
 
@@ -141,6 +155,7 @@ class ProcessMonitor:
             return
         self.parent_map[event.ProcessId] = event.ParentProcessId
         if self.is_descendant(event.ProcessId, self.root_pid):
+            self.malware_pids.add(event.ProcessId)
             self.emit("process", "process_create", _creation_event_to_evidence(event))
 
     def _poll_deletion(self, watcher):
@@ -170,6 +185,7 @@ class ProcessMonitor:
                 continue
             self.parent_map[pid] = ppid
             if self.is_descendant(pid, self.root_pid):
+                self.malware_pids.add(pid)
                 image_path = info.get("exe")
                 self.emit("process", "process_create", _build_process_create_evidence(
                     pid=pid,
