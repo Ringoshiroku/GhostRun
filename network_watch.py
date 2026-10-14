@@ -5,7 +5,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from rules_loader import load_rule_file
 
@@ -214,18 +214,28 @@ def _parse_suricata_timestamp(raw):
     entirely ("2009-11-24T21:27:09.534255").
     Python's datetime.fromisoformat() needs a colon in the offset on this
     project's 3.10 floor, so one is inserted before parsing if missing.
-    returns a float epoch timestamp, or None if raw is missing or
-    unparseable in either form.
+    returns a float epoch timestamp, or None if raw is missing, not a
+    string, or unparseable in either form.
     """
-    if not raw:
+    if not raw or not isinstance(raw, str):
         return None
     s = raw
+    had_offset = False
     if len(s) >= 5 and s[-5] in "+-" and s[-4:].isdigit():
         s = s[:-2] + ":" + s[-2:]
+        had_offset = True
     try:
-        return datetime.fromisoformat(s).timestamp()
+        dt = datetime.fromisoformat(s)
     except ValueError:
         return None
+    if not had_offset:
+        # Suricata's older no-offset format still means UTC. newer versions just
+        # spell the offset out explicitly. .timestamp() on a naive datetime
+        # otherwise silently assumes local time (per Python's own docs), which
+        # would be off by the host's UTC offset on any non-UTC sandbox host and
+        # quietly corrupt the whole attribution chain's time comparisons.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
 
 
 def _resolve_attributed_pid(event, connection_monitor, procmon, root_pid):
