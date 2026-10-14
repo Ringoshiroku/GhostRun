@@ -417,7 +417,8 @@ def _resolve_suricata_rules_path(configured_path=None, default_path=_DEFAULT_SUR
 
 class NetworkCapture:
     def __init__(self, pcap_path, eve_log_dir, emit_func, sslkeylogfile_path=None, root_pid=None,
-                 exclude_host=None, exclude_port=None, rules_path=None):
+                 exclude_host=None, exclude_port=None, rules_path=None,
+                 connection_monitor=None, procmon=None):
         self.pcap_path = pcap_path
         self.eve_log_dir = eve_log_dir
         self.emit = emit_func
@@ -430,6 +431,10 @@ class NetworkCapture:
         self.exclude_host = exclude_host
         self.exclude_port = exclude_port
         self.rules_path = rules_path
+        # both None by default (built before the sample launches, same as
+        # root_pid). patched in live once available, see ghostrun.py.
+        self.connection_monitor = connection_monitor
+        self.procmon = procmon
         self._proc = None
         self._tools_available = bool(shutil.which("dumpcap")) and bool(shutil.which("suricata"))
 
@@ -512,4 +517,7 @@ class NetworkCapture:
             return
 
         if os.path.exists(eve_path):
-            emit_network_evidence(parse_eve_file(eve_path), self.emit, root_pid=self.root_pid)
+            emit_network_evidence(
+                parse_eve_file(eve_path), self.emit, root_pid=self.root_pid,
+                connection_monitor=self.connection_monitor, procmon=self.procmon,
+            )

@@ -23,6 +23,7 @@ from mutex_watch import MutexMonitor, list_all_named_objects
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
 from process_termination import kill_process_tree
+from connection_monitor import ConnectionMonitor
 import atexit
 import signal
 
@@ -310,6 +311,10 @@ def main():
     sslkeylogfile_path = os.path.join(out_dir, "sslkeylog.txt")
     os.environ["SSLKEYLOGFILE"] = sslkeylogfile_path  # set before sample launch, opportunistic
 
+    connection_monitor = ConnectionMonitor()
+    connection_thread = threading.Thread(target=connection_monitor.run, daemon=True)
+    connection_thread.start()
+
     net_capture = NetworkCapture(
         pcap_path=os.path.join(out_dir, "capture.pcap"),
         eve_log_dir=out_dir,
@@ -317,6 +322,7 @@ def main():
         sslkeylogfile_path=sslkeylogfile_path,
         exclude_host=args.host,
         exclude_port=args.port,
+        connection_monitor=connection_monitor,
     )
     net_capture.start()
 
@@ -383,6 +389,7 @@ def main():
         root_pid=proc.pid,
         emit_func=emit
     )
+    net_capture.procmon = proc_monitor
 
     network_finding = NetworkFindingEngine(
         root_pid=proc.pid,
@@ -488,6 +495,7 @@ def main():
     proc_monitor.stop()
     persistence_watcher.stop()
     mutex_monitor.stop()
+    connection_monitor.stop()
 
     proc_thread.join(timeout=5)
     persistence_thread.join(timeout=5)
