@@ -18,7 +18,8 @@ class TimelineBuilder:
     def __init__(self, evidences):
         self.evidences = evidences
         self.timeline = []
-        self.iocs = defaultdict(set)
+        self.iocs = defaultdict(list)
+        self._seen_iocs = set()
 
     # --------------------------------------------------
     # BUILD TIMELINE
@@ -39,6 +40,13 @@ class TimelineBuilder:
     # --------------------------------------------------
     # IOC EXTRACTION
     # --------------------------------------------------
+    def _add_ioc(self, category, value, confidence, source):
+        key = (category, value, source)
+        if key in self._seen_iocs:
+            return
+        self._seen_iocs.add(key)
+        self.iocs[category].append({"value": value, "confidence": confidence, "source": source})
+
     def extract_iocs(self):
         for ev in self.evidences:
             category = ev.get("category")
@@ -49,34 +57,45 @@ class TimelineBuilder:
             if event == "static_network_indicator":
                 val = data.get("value")
                 if val:
-                    self.iocs["network"].add(val)
+                    self._add_ioc("network", val, confidence="medium", source="static_indicator")
 
-            # ---- Persistence IOC
+            # ---- persistence IOC.
+            # "location" is the field registry_snapshot.py actually emits
+            # (known_persistence_location/execution_reference_detected).
+            # this used to read "key_path", a field no production code
+            # emits, so registry IOCs never got populated.
             if category == "registry_behavior":
-                key = data.get("key_path")
+                key = data.get("location")
                 if key:
-                    self.iocs["registry"].add(key)
+                    self._add_ioc("registry", key, confidence="medium", source="registry_persistence")
 
             if category == "filesystem_behavior":
                 if event == "file_created":
                     path = data.get("path")
                     if path and not self.is_system_noise(path):
                         if path.lower().endswith((".exe", ".dll", ".ps1")):
-                            self.iocs["file"].add(path)
+                            self._add_ioc("file", path, confidence="low", source="heuristic")
 
                 if event == "mass_extension_change":
                     ext = data.get("to_ext")
                     if ext:
-                        self.iocs["extension"].add(ext)
+                        self._add_ioc("extension", ext, confidence="low", source="heuristic")
+
+                if event == "yara_match":
+                    rule = data.get("rule")
+                    path = data.get("path")
+                    if rule:
+                        value = f"{rule} ({path})" if path else rule
+                        self._add_ioc("yara_match", value, confidence="high", source="yara_scan")
 
             # ---- Executed sample (Soft IOC)
             if category == "process" and event == "process_create":
                 name = data.get("name")
                 cmd = data.get("cmdline")
                 if name:
-                    self.iocs["Executed Malware"].add(name)
+                    self._add_ioc("Executed Malware", name, confidence="low", source="heuristic")
                 if cmd:
-                    self.iocs["Execution Command"].add(" ".join(cmd))
+                    self._add_ioc("Execution Command", " ".join(cmd), confidence="low", source="heuristic")
 
             # ---- Ransom note (Soft IOC)
             if category == "filesystem_behavior" and event == "file_created":
@@ -93,16 +112,47 @@ class TimelineBuilder:
                     # matching substrings buried inside unrelated words.
                     tokens = re.split(r"[^a-z0-9]+", fname)
                     if any(t.startswith(("read", "decrypt", "recover")) for t in tokens):
-                        self.iocs["Ransom Note"].add(p)
+                        self._add_ioc("Ransom Note", p, confidence="medium", source="heuristic")
 
             # ---- Ransomware extension (Hard-ish IOC)
             if category == "filesystem_behavior" and event == "mass_extension_change":
                 ext = data.get("to_ext")
                 if ext:
-                    self.iocs["Ransomware Extension"].add(ext)
+                    self._add_ioc("Ransomware Extension", ext, confidence="medium", source="heuristic")
 
+            # ---- mutex malware-family match.
+            # confidence comes through as a top-level evidence field
+            # (emit()'s **meta), not inside data, same as
+            # network_behavior/malware_network_activity below.
+            if category == "mutex_behavior" and event == "known_malware_mutex":
+                family = data.get("family")
+                mutex = data.get("mutex")
+                if family:
+                    value = f"{family} ({mutex})" if mutex else family
+                    self._add_ioc(
+                        "mutex_family", value,
+                        confidence=ev.get("confidence", "medium"), source="mutex_signature",
+                    )
 
-        return {k: sorted(v) for k, v in self.iocs.items()}
+            # ---- network finding.
+            # pulled from the already-correlated, confidence-tiered
+            # malware_network_activity signal, not the raw
+            # ids_alert/tls_connection/http_request/flow_summary events
+            # underneath it. that engine already dedupes and tiers those
+            # into one signal, so pulling from the raw events too would
+            # just duplicate and add noise.
+            if category == "network_behavior" and event == "malware_network_activity":
+                value = (
+                    data.get("signature") or data.get("hostname")
+                    or data.get("service") or data.get("raddr")
+                )
+                if value:
+                    self._add_ioc(
+                        "network_finding", value,
+                        confidence=ev.get("confidence", "low"), source="network_behavior",
+                    )
+
+        return dict(self.iocs)
 
     # --------------------------------------------------
     # SUMMARY (OPTIONAL)
