@@ -23,7 +23,7 @@ from mutex_watch import MutexMonitor, list_all_named_objects
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
 from process_termination import kill_process_tree
-from connection_monitor import ConnectionMonitor
+from wfp_connection_watcher import WfpConnectionWatcher
 import atexit
 import signal
 
@@ -311,9 +311,26 @@ def main():
     sslkeylogfile_path = os.path.join(out_dir, "sslkeylog.txt")
     os.environ["SSLKEYLOGFILE"] = sslkeylogfile_path  # set before sample launch, opportunistic
 
-    connection_monitor = ConnectionMonitor()
-    connection_thread = threading.Thread(target=connection_monitor.run, daemon=True)
-    connection_thread.start()
+    mutex_monitor = MutexMonitor(emit_func=emit, root_pid=None, baseline=mutex_before)
+    mutex_thread = threading.Thread(
+        target=mutex_monitor.run,
+        daemon=True
+    )
+
+    proc_monitor = ProcessMonitor(
+        root_pid=None,
+        emit_func=emit,
+        malware_pids=MALWARE_PIDS,
+        mutex_monitor=mutex_monitor,
+    )
+
+    network_finding = NetworkFindingEngine(
+        root_pid=None,
+        process_monitor=proc_monitor
+    )
+
+    wfp_watcher = WfpConnectionWatcher(process_monitor=proc_monitor, emit_func=emit)
+    wfp_watcher.start()
 
     net_capture = NetworkCapture(
         pcap_path=os.path.join(out_dir, "capture.pcap"),
@@ -322,7 +339,7 @@ def main():
         sslkeylogfile_path=sslkeylogfile_path,
         exclude_host=args.host,
         exclude_port=args.port,
-        connection_monitor=connection_monitor,
+        connection_monitor=wfp_watcher,
     )
     net_capture.start()
 
@@ -331,6 +348,9 @@ def main():
         ROOTPID = proc.pid
         MALWARE_PIDS.add(ROOTPID)
         net_capture.root_pid = ROOTPID
+        proc_monitor.root_pid = ROOTPID
+        mutex_monitor.root_pid = ROOTPID
+        network_finding.root_pid = ROOTPID
 
         # captured now, right after launch, while the Popen handle is still
         # guaranteed to be pinned to this pid
@@ -385,17 +405,6 @@ def main():
     fs_watcher.start()
 
     # Process monitor
-    proc_monitor = ProcessMonitor(
-        root_pid=proc.pid,
-        emit_func=emit,
-        malware_pids=MALWARE_PIDS,
-    )
-
-    network_finding = NetworkFindingEngine(
-        root_pid=proc.pid,
-        process_monitor=proc_monitor
-    )
-
     proc_thread = threading.Thread(
         target=proc_monitor.run,
         daemon=True
@@ -410,11 +419,6 @@ def main():
     )
     persistence_thread.start()
 
-    mutex_monitor = MutexMonitor(emit_func=emit, root_pid=ROOTPID, baseline=mutex_before)
-    mutex_thread = threading.Thread(
-        target=mutex_monitor.run,
-        daemon=True
-    )
     mutex_thread.start()
 
     # safety-net retry: the primary post-timeout kill below runs right after
@@ -494,8 +498,9 @@ def main():
     # -----------------------------------------------------
     proc_monitor.stop()
     persistence_watcher.stop()
+    mutex_monitor.trigger_scan()
     mutex_monitor.stop()
-    connection_monitor.stop()
+    wfp_watcher.stop()
 
     proc_thread.join(timeout=5)
     persistence_thread.join(timeout=5)
