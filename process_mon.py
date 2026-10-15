@@ -156,7 +156,10 @@ class ProcessMonitor:
         two live descendants with the same executable path are treated as
         no match on purpose, picking a specific wrong process would be worse.
         """
-        matches = [pid for pid, image_path in self.image_paths.items() if image_path == path]
+        # list() takes a snapshot before iterating
+        # _poll_creation/_poll_deletion mutate image_paths from another thread
+        # iterating it live could raise "dictionary changed size during iteration"
+        matches = [pid for pid, image_path in list(self.image_paths.items()) if image_path == path]
         return matches[0] if len(matches) == 1 else None
 
     def _poll_creation(self, watcher):
