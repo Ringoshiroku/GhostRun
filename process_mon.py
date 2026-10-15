@@ -122,6 +122,7 @@ class ProcessMonitor:
         self.running = True
 
         self.parent_map = {}
+        self.image_paths = {}  # pid to image path, updated live as descendants appear and exit
         # shared mutable set, same object as ghostrun.py's MALWARE_PIDS global
         # passed by reference, not copied
         # grows as this monitor discovers real descendants
@@ -148,6 +149,16 @@ class ProcessMonitor:
             current = self.parent_map.get(current)
         return False
 
+    def resolve_path_to_pid(self, path):
+        """
+        return the one tracked descendant pid whose image path matches `path`.
+        returns none if zero or more than one match.
+        two live descendants with the same executable path are treated as
+        no match on purpose, picking a specific wrong process would be worse.
+        """
+        matches = [pid for pid, image_path in self.image_paths.items() if image_path == path]
+        return matches[0] if len(matches) == 1 else None
+
     def _poll_creation(self, watcher):
         try:
             event = watcher(timeout_ms=500)
@@ -156,6 +167,7 @@ class ProcessMonitor:
         self.parent_map[event.ProcessId] = event.ParentProcessId
         if self.is_descendant(event.ProcessId, self.root_pid):
             self.malware_pids.add(event.ProcessId)
+            self.image_paths[event.ProcessId] = getattr(event, "ExecutablePath", None)
             self.emit("process", "process_create", _creation_event_to_evidence(event))
 
     def _poll_deletion(self, watcher):
@@ -163,6 +175,7 @@ class ProcessMonitor:
             event = watcher(timeout_ms=500)
         except wmi.x_wmi_timed_out:
             return
+        self.image_paths.pop(event.ProcessId, None)
         if self.is_descendant(event.ProcessId, self.root_pid):
             self.emit("process", "process_terminate", _deletion_event_to_evidence(event))
 
@@ -187,6 +200,7 @@ class ProcessMonitor:
             if self.is_descendant(pid, self.root_pid):
                 self.malware_pids.add(pid)
                 image_path = info.get("exe")
+                self.image_paths[pid] = image_path
                 self.emit("process", "process_create", _build_process_create_evidence(
                     pid=pid,
                     ppid=ppid,
