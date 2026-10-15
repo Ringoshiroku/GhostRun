@@ -1,5 +1,6 @@
 import ctypes
 import os
+import threading
 import time
 from ctypes import wintypes
 
@@ -250,6 +251,18 @@ class MutexMonitor:
         # away as "pre-existing"
         self._baseline = baseline
         self._degraded_notified = False
+        self._scan_lock = threading.Lock()
+
+    def trigger_scan(self):
+        """
+        runs one scan immediately, outside the periodic timer.
+        safe to call from another thread. never raises: _poll_once already
+        degrades internally (see its own ghostrun_status handling), and the
+        lock below only serializes concurrent callers, it doesn't add a
+        new failure mode.
+        """
+        with self._scan_lock:
+            self._poll_once()
 
     def _poll_once(self):
         current, sources = list_all_named_objects()
@@ -287,7 +300,8 @@ class MutexMonitor:
                 time.sleep(self.poll_interval)
                 if not self.running:
                     break
-                self._poll_once()
+                with self._scan_lock:
+                    self._poll_once()
         finally:
             self.emit("mutex", "monitor_stop", {})
 
