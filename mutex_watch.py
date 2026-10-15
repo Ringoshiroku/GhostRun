@@ -256,10 +256,12 @@ class MutexMonitor:
     def trigger_scan(self):
         """
         runs one scan immediately, outside the periodic timer.
-        safe to call from another thread. never raises: _poll_once already
-        degrades internally (see its own ghostrun_status handling), and the
-        lock below only serializes concurrent callers, it doesn't add a
-        new failure mode.
+        safe to call from another thread. the lock serializes this scan
+        against the periodic run() loop and other triggered scans, so the
+        baseline's read-diff-write never interleaves. it does not make
+        emit() itself safe to raise from: an exception from emit() or
+        classify_mutex_event() still propagates to the caller, same as
+        from run()'s loop.
         """
         with self._scan_lock:
             self._poll_once()
