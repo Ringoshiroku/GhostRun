@@ -120,6 +120,7 @@ class ProcessMonitor:
         self.root_pid = root_pid
         self.emit = emit_func
         self.mutex_monitor = mutex_monitor
+        self._mutex_scan_degraded_notified = False
         self.running = True
 
         self.parent_map = {}
@@ -132,8 +133,26 @@ class ProcessMonitor:
         self.malware_pids = malware_pids if malware_pids is not None else set()
 
     def _trigger_mutex_scan(self):
-        if self.mutex_monitor is not None:
+        """
+        run a triggered MutexMonitor scan.
+        a failure here must not escape: run()'s loop only catches wmi.x_wmi,
+        so an uncaught exception would silently kill process tracking
+        (lineage, malware_pids, image paths).
+        degrade instead with a ghostrun_status notice, emitted once until
+        a scan succeeds again.
+        """
+        if self.mutex_monitor is None:
+            return
+        try:
             self.mutex_monitor.trigger_scan()
+        except Exception as exc:
+            if not self._mutex_scan_degraded_notified:
+                self.emit("ghostrun_status", "mutex_scan_failed", {
+                    "error": str(exc),
+                })
+                self._mutex_scan_degraded_notified = True
+            return
+        self._mutex_scan_degraded_notified = False
 
     def is_descendant(self, pid, root_pid):
         """
