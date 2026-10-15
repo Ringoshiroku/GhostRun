@@ -76,9 +76,18 @@ class WfpConnectionWatcher:
         shared by stop()'s normal teardown and start()'s degrade path, so
         a watcher that flips the policy on and then fails to start
         doesn't leave it changed.
+
+        if the revert call itself fails (e.g. auditpol becomes
+        unavailable mid-run), that failure is surfaced as an emitted
+        event instead of staying silent. self._audit_policy_changed is
+        still cleared either way, so a later stop() call won't retry.
         """
         if self._audit_policy_changed:
-            set_filtering_platform_connection_audit(False)
+            reverted = set_filtering_platform_connection_audit(False)
+            if not reverted:
+                self.emit("ghostrun_status", "audit_policy_revert_failed", {
+                    "reason": "set_filtering_platform_connection_audit(False) returned False",
+                })
             self._audit_policy_changed = False
 
     def resolve_pid(self, local_port, approx_timestamp):

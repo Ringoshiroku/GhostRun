@@ -1,4 +1,5 @@
 import sys
+import os
 import types
 import hashlib
 import shlex
@@ -179,11 +180,21 @@ class ProcessMonitor:
         returns none if zero or more than one match.
         two live descendants with the same executable path are treated as
         no match on purpose, picking a specific wrong process would be worse.
+
+        comparison is case-insensitive (os.path.normcase): windows paths are
+        case-insensitive by convention, and different sources (wmi, psutil,
+        eventually wfp) can report the same real path with different casing.
+        nt device-style paths (e.g. \\Device\\HarddiskVolume3\\...) are out
+        of scope here until we see real wfp output.
         """
         # list() takes a snapshot before iterating
         # _poll_creation/_poll_deletion mutate image_paths from another thread
         # iterating it live could raise "dictionary changed size during iteration"
-        matches = [pid for pid, image_path in list(self.image_paths.items()) if image_path == path]
+        normalized = os.path.normcase(path)
+        matches = [
+            pid for pid, image_path in list(self.image_paths.items())
+            if os.path.normcase(image_path) == normalized
+        ]
         return matches[0] if len(matches) == 1 else None
 
     def _poll_creation(self, watcher):

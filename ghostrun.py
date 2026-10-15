@@ -117,50 +117,64 @@ def on_exit():
     # idempotent and safe to call again even if normal teardown already
     # called it (set_filtering_platform_connection_audit only runs when this
     # instance is the one that changed it in the first place)
-    if wfp_watcher is not None:
-        try:
-            wfp_watcher.stop()
-        except Exception:
-            pass
-
+    #
+    # safety first: when a sample was actually launched, killing its process
+    # tree takes priority over reverting the audit policy
+    # wfp_watcher.stop()'s revert call can itself take several seconds (its
+    # own subprocess has a timeout), and the sample must not keep running
+    # during that wait on an abnormal exit (ctrl+c, crash)
+    # wfp_watcher.stop() still always runs, via finally, even if the kill
+    # raises, so exactly one stop() call happens on every path through this
+    # function
     pid = MALWARE_IDENTITY.get("pid")
 
     if not pid:
+        if wfp_watcher is not None:
+            try:
+                wfp_watcher.stop()
+            except Exception:
+                pass
         return  # sample belum sempat start
 
     try:
-        emit(
-            category="execution",
-            event="process_terminating",
-            data={"pid": pid}
-        )
-        time.sleep(0.5)  # beri waktu sender kirim
-    except:
-        pass
+        try:
+            emit(
+                category="execution",
+                event="process_terminating",
+                data={"pid": pid}
+            )
+            time.sleep(0.5)  # give the sender time to send
+        except:
+            pass
 
-    # safety net: on_exit() is already registered for atexit, SIGINT, and
-    # SIGTERM below
-    # together those cover normal completion, an uncaught exception out of
-    # main(), and the analyst interrupting the run
-    # so this is the one place that reliably runs across all three, without
-    # a separate try/finally wrapper
-    # idempotent and safe even if the primary post-timeout kill (see section
-    # 5 below) already handled it, a no-op in that case
-    #
-    # by this point the kill happens well after sample launch, so the
-    # original Popen handle may be gone and the os may have reused this pid
-    # for an unrelated process
-    # expected_create_time guards against killing that unrelated process by
-    # mistake
-    # the evidence pipeline may already be shut down or never started (e.g.
-    # on an uncaught exception before any dump), so a failure here is
-    # printed synchronously, it's the only chance to see it
-    _, failed_pids = kill_process_tree(
-        pid, emit, trigger="on_exit", expected_create_time=MALWARE_IDENTITY.get("create_time")
-    )
-    if failed_pids:
-        print(f"[GhostRun] WARNING: failed to confirm termination of PID(s) {failed_pids} on exit")
-        
+        # safety net: on_exit() is already registered for atexit, SIGINT, and
+        # SIGTERM
+        # together those cover normal completion, an uncaught exception out of
+        # main(), and the analyst interrupting the run
+        # so this is the one place that reliably runs across all three, without
+        # a separate try/finally wrapper
+        # idempotent and safe even if the primary post-timeout kill (see section
+        # 5 below) already handled it, a no-op in that case#
+        # by this point the kill happens well after sample launch, so the
+        # original Popen handle may be gone and the os may have reused this pid
+        # for an unrelated process
+        # expected_create_time guards against killing that unrelated process by
+        # mistake
+        # the evidence pipeline may already be shut down or never started (e.g.
+        # on an uncaught exception before any dump), so a failure here is
+        # printed synchronously, it's the only chance to see it
+        _, failed_pids = kill_process_tree(
+            pid, emit, trigger="on_exit", expected_create_time=MALWARE_IDENTITY.get("create_time")
+        )
+        if failed_pids:
+            print(f"[GhostRun] WARNING: failed to confirm termination of PID(s) {failed_pids} on exit")
+    finally:
+        if wfp_watcher is not None:
+            try:
+                wfp_watcher.stop()
+            except Exception:
+                pass
+
 def sender_worker():
     while True:
         try:
@@ -353,6 +367,18 @@ def main():
     wfp_watcher = WfpConnectionWatcher(process_monitor=proc_monitor, emit_func=emit)
     wfp_watcher.start()
 
+    # registered here, right after wfp_watcher is up, rather than after the
+    # Popen try/except below
+    # if Popen itself fails (e.g. a bad -s path) and sys.exit(1) fires,
+    # on_exit() must already be registered so it still runs and reverts the
+    # audit-policy change wfp_watcher.start() may have just made
+    # on_exit() has an early-return path for pid not being set yet, so
+    # registering this early is safe even though ROOTPID doesn't exist until
+    # after Popen succeeds
+    atexit.register(on_exit)
+    signal.signal(signal.SIGTERM, lambda s, f: on_exit())
+    signal.signal(signal.SIGINT, lambda s, f: on_exit())
+
     net_capture = NetworkCapture(
         pcap_path=os.path.join(out_dir, "capture.pcap"),
         eve_log_dir=out_dir,
@@ -393,10 +419,6 @@ def main():
     except Exception as e:
         print(f"[GhostRun] ERROR: Failed to execute sample: {e}")
         sys.exit(1)
-
-    atexit.register(on_exit)
-    signal.signal(signal.SIGTERM, lambda s, f: on_exit())
-    signal.signal(signal.SIGINT, lambda s, f: on_exit())
 
     # -----------------------------------------------------
     # 4️⃣ Start monitors (THREADING)
