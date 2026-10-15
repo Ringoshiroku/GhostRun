@@ -37,6 +37,7 @@ network_infer = None
 EVIDENCE_QUEUE = queue.Queue()
 ALL_EVIDENCE = []
 network_finding = None
+wfp_watcher = None
 
 MALWARE_IDENTITY = {
     "pid": None,
@@ -107,6 +108,21 @@ def emit(category, event, data, **meta):
 
 
 def on_exit():
+    # stop the wfp watcher on every abnormal exit (an uncaught exception,
+    # SIGINT, or SIGTERM), not just the normal post-timeout teardown path
+    # below
+    # once _native_start/_native_stop are real, a run that never reaches that
+    # teardown would otherwise leave the host's "filtering platform
+    # connection" audit subcategory permanently enabled
+    # idempotent and safe to call again even if normal teardown already
+    # called it (set_filtering_platform_connection_audit only runs when this
+    # instance is the one that changed it in the first place)
+    if wfp_watcher is not None:
+        try:
+            wfp_watcher.stop()
+        except Exception:
+            pass
+
     pid = MALWARE_IDENTITY.get("pid")
 
     if not pid:
@@ -208,7 +224,7 @@ def main():
 
     print("[GhostRun] Starting controller")
 
-    global persistence, network_infer, network_finding
+    global persistence, network_infer, network_finding, wfp_watcher
 
     FS_TARGETS = {
         "TEMP": os.environ.get("TEMP"),
@@ -300,9 +316,14 @@ def main():
     # it. opportunistic: only helps if the sample uses an SSLKEYLOGFILE-aware
     # TLS stack
     # capture starts before the sample launches so it doesn't miss early traffic
-    # ROOTPID isn't known yet, so net_capture is built with root_pid=None and
-    # patched in live once the sample's PID is known, same as FilesystemWatcher
-    # above
+    # ROOTPID isn't known yet, so net_capture, mutex_monitor, proc_monitor,
+    # and network_finding are all built with root_pid=None and patched in
+    # live once the sample's PID is known, same as FilesystemWatcher above
+    # mutex_monitor and proc_monitor are built here, not down in section 4
+    # where their threads actually start, because WfpConnectionWatcher needs
+    # a built proc_monitor to resolve ports to pids
+    # and proc_monitor's own run() calls mutex_monitor.trigger_scan() as soon
+    # as its thread starts, so mutex_monitor must already exist by then too
     # os.path.dirname(args.file) is "" when --file is a bare filename with no
     # directory part, and suricata's -l flag rejects that outright ("logging
     # directory "" ... doesn't exist")
@@ -404,14 +425,15 @@ def main():
     fs_watcher = FilesystemWatcher(targets=FS_TARGETS, emit_func=emit, root_pid=ROOTPID, yara_rules=yara_rules)
     fs_watcher.start()
 
-    # Process monitor
+    # process monitor: proc_monitor was already built above (before Popen),
+    # this just starts its thread now that ROOTPID exists
     proc_thread = threading.Thread(
         target=proc_monitor.run,
         daemon=True
     )
     proc_thread.start()
 
-    # wmi persistence watcher (t1546.003) and named-object (mutex) monitor
+    # wmi persistence watcher (t1546.003)
     persistence_watcher = PersistenceWatcher(emit_func=emit, root_pid=ROOTPID)
     persistence_thread = threading.Thread(
         target=persistence_watcher.run,
@@ -419,6 +441,8 @@ def main():
     )
     persistence_thread.start()
 
+    # named-object (mutex) monitor: mutex_monitor and mutex_thread were
+    # already built above (before Popen), this just starts the thread
     mutex_thread.start()
 
     # safety-net retry: the primary post-timeout kill below runs right after
@@ -498,7 +522,18 @@ def main():
     # -----------------------------------------------------
     proc_monitor.stop()
     persistence_watcher.stop()
-    mutex_monitor.trigger_scan()
+    # one final triggered scan to catch anything created in the sample's
+    # last moments, before the monitor thread stops
+    # guarded the same way ProcessMonitor._trigger_mutex_scan() guards this
+    # exact call: a failure here must not skip the rest of teardown below it
+    # (stop(), wfp_watcher.stop()'s audit-policy revert, the thread joins,
+    # and the pcap/suricata analysis)
+    try:
+        mutex_monitor.trigger_scan()
+    except Exception as exc:
+        emit("ghostrun_status", "mutex_scan_failed", {
+            "error": str(exc),
+        })
     mutex_monitor.stop()
     wfp_watcher.stop()
 
