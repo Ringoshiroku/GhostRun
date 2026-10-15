@@ -116,9 +116,10 @@ def _connect_wmi():
 
 
 class ProcessMonitor:
-    def __init__(self, root_pid, emit_func, malware_pids=None):
+    def __init__(self, root_pid, emit_func, malware_pids=None, mutex_monitor=None):
         self.root_pid = root_pid
         self.emit = emit_func
+        self.mutex_monitor = mutex_monitor
         self.running = True
 
         self.parent_map = {}
@@ -129,6 +130,10 @@ class ProcessMonitor:
         # that's what lets emit()'s noise filter correctly accept network evidence
         # for a child process instead of dropping it
         self.malware_pids = malware_pids if malware_pids is not None else set()
+
+    def _trigger_mutex_scan(self):
+        if self.mutex_monitor is not None:
+            self.mutex_monitor.trigger_scan()
 
     def is_descendant(self, pid, root_pid):
         """
@@ -172,6 +177,7 @@ class ProcessMonitor:
             self.malware_pids.add(event.ProcessId)
             self.image_paths[event.ProcessId] = getattr(event, "ExecutablePath", None)
             self.emit("process", "process_create", _creation_event_to_evidence(event))
+            self._trigger_mutex_scan()
 
     def _poll_deletion(self, watcher):
         try:
@@ -181,6 +187,7 @@ class ProcessMonitor:
         self.image_paths.pop(event.ProcessId, None)
         if self.is_descendant(event.ProcessId, self.root_pid):
             self.emit("process", "process_terminate", _deletion_event_to_evidence(event))
+            self._trigger_mutex_scan()
 
     def _seed_existing_processes(self):
         """
@@ -212,6 +219,7 @@ class ProcessMonitor:
                     image_path=image_path,
                     create_time=None,
                 ))
+                self._trigger_mutex_scan()
 
     def run(self):
         self.emit("process", "monitor_start", {
