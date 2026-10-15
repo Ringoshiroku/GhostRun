@@ -32,23 +32,51 @@ class WfpConnectionWatcher:
         remembers whether this instance was the one that flipped it, so
         stop() only restores a setting it actually changed, never an
         existing operator setting.
-        then tries the native wfp subscription. on failure, degrades to
-        an emitted status event instead of raising, same as every other
-        optional capability in this codebase.
+        then tries the native wfp subscription. on failure, whether a
+        false return or a raised exception (today's NotImplementedError
+        stub, or a real failure later), degrades to an emitted status
+        event instead of raising or crashing the caller, same as every
+        other optional capability in this codebase.
+        also reverts the audit-policy flip before returning on that path:
+        a watcher that never actually started shouldn't leave the host's
+        audit policy changed, especially since a caller that treats a
+        degraded start as "never ran" has no reason to call stop().
         """
         was_enabled = query_filtering_platform_connection_audit()
         if was_enabled is False:
             if set_filtering_platform_connection_audit(True):
                 self._audit_policy_changed = True
 
-        if not self._native_start():
+        try:
+            native_started = self._native_start()
+        except Exception:
+            native_started = False
+
+        if not native_started:
+            self._revert_audit_policy_if_changed()
             self.emit("ghostrun_status", "wfp_watcher_degraded", {
                 "reason": "WFP engine open or event subscription failed",
             })
             return
 
     def stop(self):
-        self._native_stop()
+        # best-effort teardown.
+        # a failing or raising _native_stop() (e.g. today's NotImplementedError
+        # stub) must not stop the audit-policy restore below from running.
+        try:
+            self._native_stop()
+        except Exception:
+            pass
+        self._revert_audit_policy_if_changed()
+
+    def _revert_audit_policy_if_changed(self):
+        """
+        turns the audit subcategory back off, but only if this instance
+        is the one that turned it on (self._audit_policy_changed).
+        shared by stop()'s normal teardown and start()'s degrade path, so
+        a watcher that flips the policy on and then fails to start
+        doesn't leave it changed.
+        """
         if self._audit_policy_changed:
             set_filtering_platform_connection_audit(False)
             self._audit_policy_changed = False
