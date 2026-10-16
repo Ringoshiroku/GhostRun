@@ -1,4 +1,4 @@
-from network_watch import CAPTURE_CONNECTION_EVENTS
+from network_watch import CAPTURE_CONNECTION_EVENTS, _RESOLVED_PID_NOTE
 from rules_loader import load_rule_file
 
 # same idea as timeline_builder.py's SYSTEM_PATH_KEYWORDS/is_system_noise,
@@ -80,6 +80,11 @@ class NetworkFindingEngine:
             return
         self._seen.add(key)
 
+        # three-way attribution: "resolved" only when pid_attribution is
+        # exactly _RESOLVED_PID_NOTE. anything else, the fallback note, a
+        # missing key, a future third value, counts as "unknown".
+        attribution_confidence = "resolved" if data.get("pid_attribution") == _RESOLVED_PID_NOTE else "unknown"
+
         self.findings.append({
             "pid": pid,
             "event": event,
@@ -90,6 +95,7 @@ class NetworkFindingEngine:
             "signature": data.get("signature"),
             "category": data.get("category"),
             "severity": data.get("severity"),
+            "attribution_confidence": attribution_confidence,
         })
 
     def analyze(self, emit):
