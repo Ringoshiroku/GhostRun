@@ -91,8 +91,18 @@ def _etw_process_start_to_evidence(pid, ppid, name, image_path, create_time):
 # - EVENT_RECORD, EVENT_HEADER, EVENT_DESCRIPTOR, ETW_BUFFER_CONTEXT: fields from
 #   learn.microsoft.com's evntcons/evntprov/relogger pages, cross-checked against elastic's
 #   go etw consumer (github.com/elastic/beats, libbeat/reader/etw/syscall_tdh.go), which match.
-# - EVENT_TRACE_PROPERTIES, WNODE_HEADER, EVENT_TRACE_LOGFILEW: fields pre-verified against
-#   learn.microsoft.com's evntrace pages, used as given.
+# - EVENT_TRACE_PROPERTIES, WNODE_HEADER: fields pre-verified against learn.microsoft.com's
+#   evntrace/wnode-header pages, used as given.
+# - EVENT_TRACE_LOGFILEW and every struct it embeds by value (event_trace, EVENT_TRACE_HEADER,
+#   TRACE_LOGFILE_HEADER, TIME_ZONE_INFORMATION, systemtime): re-fetched and declared with
+#   their real full layouts, not opaque buffers, see each struct's own comment for the exact
+#   page and offset arithmetic, and the comment above _SYSTEMTIME for why this matters.
+# - processstart template versions 1-3 and processstop versions 1-2: re-read from the same
+#   repnz manifest url. a live session sends the newest version (processstart v3, template
+#   ProcessRundownArgs_V1), which carries a win:sid MandatoryLabel before ImageName, see
+#   _tdh_decode_event_properties for how that's walked.
+# - WINEVENT_KEYWORD_PROCESS = 0x10: same manifest's <keywords> block, events 1 and 2 are
+#   both declared under it.
 # - StartTraceW / ControlTraceW signatures: fetched from learn.microsoft.com's dedicated pages.
 #   those pages' parameter prose is stale, so the signature was resolved from
 #   EnableTraceEx2's worked c example instead. CONTROLTRACE_ID is confirmed (via system
@@ -144,6 +154,18 @@ _EVENT_TRACE_CONTROL_STOP = 1
 _EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1
 _TRACE_LEVEL_INFORMATION = 4
 _ERROR_INSUFFICIENT_BUFFER = 122
+# learn.microsoft.com/.../system-error-codes--0-499- (fetched 2026-10-16):
+# ERROR_ALREADY_EXISTS = 183 (0xb7)
+# StartTraceW's own page: "a session with the same name or guid is already running"
+_ERROR_ALREADY_EXISTS = 183
+# microsoft-windows-kernel-process manifest <keywords> block (repnz url above):
+# WINEVENT_KEYWORD_PROCESS mask="0x10", events 1 (ProcessStart) and 2 (ProcessStop)
+# are declared under it
+# passed as EnableTraceEx2's MatchAnyKeyword instead of 0: per its own remarks, for a
+# manifest provider a MatchAnyKeyword of 0 is treated the same as 0xffffffffffffffff,
+# i.e. it enables all event keywords (thread, image-load, job, ...), which only adds
+# real-time buffer pressure for events this module discards
+_WINEVENT_KEYWORD_PROCESS = 0x10
 # this module only runs ProcessTrace with one real-time session handle
 # on 64-bit windows (GhostRun's only supported target), so
 # INVALID_PROCESSTRACE_HANDLE is always the 64-bit form
@@ -257,22 +279,138 @@ class _EVENT_TRACE_PROPERTIES(ctypes.Structure):
     ]
 
 
-class _TRACE_LOGFILE_HEADER_OPAQUE(ctypes.Structure):
-    # EVENT_TRACE_LOGFILEW embeds TRACE_LOGFILE_HEADER as output-only,
-    # never read by this module, declared as an opaque, generously sized
-    # byte buffer instead of guessing its layout
-    # verify the real size with sizeof() on a live windows host, widen if it fails
-    _fields_ = [("_opaque", ctypes.c_byte * 256)]
+# EVENT_TRACE_LOGFILEW and the structs it embeds by value (event_trace,
+# EVENT_TRACE_HEADER, TRACE_LOGFILE_HEADER, TIME_ZONE_INFORMATION, systemtime)
+# are declared below with their real, full field layouts, not as opaque byte buffers.
+# CurrentEvent and LogfileHeader sit in the middle of EVENT_TRACE_LOGFILEW, so a size
+# error in them shifts every later field, including EventRecordCallback, the pointer
+# ProcessTrace actually calls
+# an earlier "generously sized" opaque declaration (128/256 bytes instead of the real
+# 88/280) put EventRecordCallback at offset 440 instead of the real 424 on x64, so the
+# callback would never have been invoked on a live host
+#
+# every win32 ulong/long/word/wchar below uses an explicit fixed-width ctypes type
+# (c_uint32/c_int32/c_uint16), never c_ulong/c_long/c_wchar: those are 8/8/4 bytes on
+# a 64-bit linux host versus 4/4/2 on windows, so fixed widths keep this layout
+# identical on both and let test_EVENT_TRACE_LOGFILEW_matches_real_x64_layout prove
+# the real windows offsets on this non-windows dev host. pointer-typed fields
+# (lpwstr/pvoid/callback pointers) are pointer-sized on both
+#
+# expected x64 sizes/offsets, derived by hand from the cited syntax blocks (natural
+# alignment, no pragma pack in evntrace.h): systemtime 16, TIME_ZONE_INFORMATION 172,
+# EVENT_TRACE_HEADER 48, event_trace 88, TRACE_LOGFILE_HEADER 280,
+# EVENT_TRACE_LOGFILEW 448 with EventRecordCallback at 424
 
 
-class _EVENT_TRACE_OPAQUE(ctypes.Structure):
-    # same rationale as _TRACE_LOGFILE_HEADER_OPAQUE above, for
-    # EVENT_TRACE_LOGFILEW's CurrentEvent field
-    _fields_ = [("_opaque", ctypes.c_byte * 128)]
+class _SYSTEMTIME(ctypes.Structure):
+    # verified against learn.microsoft.com/.../ns-minwinbase-systemtime, fetched 2026-10-16
+    # eight words, 16 bytes
+    _fields_ = [
+        ("wYear", ctypes.c_uint16),
+        ("wMonth", ctypes.c_uint16),
+        ("wDayOfWeek", ctypes.c_uint16),
+        ("wDay", ctypes.c_uint16),
+        ("wHour", ctypes.c_uint16),
+        ("wMinute", ctypes.c_uint16),
+        ("wSecond", ctypes.c_uint16),
+        ("wMilliseconds", ctypes.c_uint16),
+    ]
+
+
+class _TIME_ZONE_INFORMATION(ctypes.Structure):
+    # verified against learn.microsoft.com/.../ns-timezoneapi-time_zone_information, fetched
+    # 2026-10-16: long bias; wchar StandardName[32]; systemtime StandardDate; long
+    # StandardBias; wchar DaylightName[32]; systemtime DaylightDate; long DaylightBias
+    # 4+64+16+4+64+16+4 = 172 bytes (max member alignment 4, no tail padding)
+    # wchar is declared as c_uint16, not c_wchar (4 bytes on linux); this module never
+    # reads these names
+    _fields_ = [
+        ("Bias", ctypes.c_int32),
+        ("StandardName", ctypes.c_uint16 * 32),
+        ("StandardDate", _SYSTEMTIME),
+        ("StandardBias", ctypes.c_int32),
+        ("DaylightName", ctypes.c_uint16 * 32),
+        ("DaylightDate", _SYSTEMTIME),
+        ("DaylightBias", ctypes.c_int32),
+    ]
+
+
+class _EVENT_TRACE_HEADER(ctypes.Structure):
+    # verified against learn.microsoft.com/.../ns-evntrace-event_trace_header, fetched
+    # 2026-10-16: ushort size; a 2-byte union; a 4-byte union; ulong ThreadId; ulong
+    # ProcessId; LARGE_INTEGER TimeStamp; a 16-byte union (guid or ulonglong); a final
+    # 8-byte union
+    # 2+2+4+4+4=16, TimeStamp at 16, guid at 24, the last union at 40, 48 bytes total
+    # each union is collapsed to one member of its exact width, this module never reads
+    # any of these fields (CurrentEvent is output-only), they only need the right size
+    _fields_ = [
+        ("Size", ctypes.c_uint16),
+        ("FieldTypeFlags", ctypes.c_uint16),
+        ("Version", ctypes.c_uint32),
+        ("ThreadId", ctypes.c_uint32),
+        ("ProcessId", ctypes.c_uint32),
+        ("TimeStamp", ctypes.c_int64),
+        ("Guid", _GUID),
+        ("ProcessorTime", ctypes.c_uint64),
+    ]
+
+
+class _EVENT_TRACE(ctypes.Structure):
+    # verified against learn.microsoft.com/.../ns-evntrace-event_trace, fetched 2026-10-16:
+    # EVENT_TRACE_HEADER header; ulong instanceid; ulong ParentInstanceId; guid
+    # ParentGuid; pvoid MofData; ulong MofLength; a 4-byte union
+    # 48+4+4+16=72, MofData at 72, MofLength at 80, the union at 84, 88 bytes total
+    # the union is collapsed to its ulong member (ETW_BUFFER_CONTEXT is also 4 bytes)
+    _fields_ = [
+        ("Header", _EVENT_TRACE_HEADER),
+        ("InstanceId", ctypes.c_uint32),
+        ("ParentInstanceId", ctypes.c_uint32),
+        ("ParentGuid", _GUID),
+        ("MofData", ctypes.c_void_p),
+        ("MofLength", ctypes.c_uint32),
+        ("ClientContext", ctypes.c_uint32),
+    ]
+
+
+class _TRACE_LOGFILE_HEADER(ctypes.Structure):
+    # verified against learn.microsoft.com/.../ns-evntrace-trace_logfile_header, fetched
+    # 2026-10-16: ulong BufferSize; a 4-byte union; ulong ProviderVersion; ulong
+    # NumberOfProcessors; LARGE_INTEGER EndTime; ulong TimerResolution; ulong
+    # MaximumFileSize; ulong LogFileMode; ulong BuffersWritten; a 16-byte union
+    # (LogInstanceGuid); lpwstr LoggerName; lpwstr LogFileName; TIME_ZONE_INFORMATION
+    # TimeZone; LARGE_INTEGER BootTime; LARGE_INTEGER PerfFreq; LARGE_INTEGER StartTime;
+    # ulong ReservedFlags; ulong BuffersLost
+    # (the page's syntax block renders the LoggerName/LogFileName/TimeZone #if/#else
+    # confusingly, but its members and remarks sections confirm all three are present
+    # in the user-mode build: two pointers then the time zone)
+    # x64: 16 bytes of ulongs, EndTime at 16, four ulongs to 40, the guid union at 40,
+    # LoggerName at 56, LogFileName at 64, TimeZone at 72 (172 bytes, to 244), BootTime
+    # 8-aligned at 248, PerfFreq 256, StartTime 264, ReservedFlags 272, BuffersLost 276,
+    # 280 bytes total
+    _fields_ = [
+        ("BufferSize", ctypes.c_uint32),
+        ("Version", ctypes.c_uint32),
+        ("ProviderVersion", ctypes.c_uint32),
+        ("NumberOfProcessors", ctypes.c_uint32),
+        ("EndTime", ctypes.c_int64),
+        ("TimerResolution", ctypes.c_uint32),
+        ("MaximumFileSize", ctypes.c_uint32),
+        ("LogFileMode", ctypes.c_uint32),
+        ("BuffersWritten", ctypes.c_uint32),
+        ("LogInstanceGuid", _GUID),
+        ("LoggerName", ctypes.c_void_p),   # lpwstr, never read ("do not use this field")
+        ("LogFileName", ctypes.c_void_p),  # lpwstr, never read ("do not use this field")
+        ("TimeZone", _TIME_ZONE_INFORMATION),
+        ("BootTime", ctypes.c_int64),
+        ("PerfFreq", ctypes.c_int64),
+        ("StartTime", ctypes.c_int64),
+        ("ReservedFlags", ctypes.c_uint32),
+        ("BuffersLost", ctypes.c_uint32),
+    ]
 
 
 class _ProcessTraceModeUnion(ctypes.Union):
-    _fields_ = [("LogFileMode", ctypes.c_ulong), ("ProcessTraceMode", ctypes.c_ulong)]
+    _fields_ = [("LogFileMode", ctypes.c_uint32), ("ProcessTraceMode", ctypes.c_uint32)]
 
 
 class _EventCallbackUnion(ctypes.Union):
@@ -280,23 +418,30 @@ class _EventCallbackUnion(ctypes.Union):
 
 
 class _EVENT_TRACE_LOGFILEW(ctypes.Structure):
-    # given by the implementation brief, pre-verified against
-    # learn.microsoft.com/.../ns-evntrace-event_trace_logfilew, used as given
+    # verified against learn.microsoft.com/.../ns-evntrace-EVENT_TRACE_logfilew, fetched
+    # 2026-10-16: lpwstr LogFileName; lpwstr LoggerName; longlong CurrentTime; ulong
+    # BuffersRead; a 4-byte union (LogFileMode/ProcessTraceMode); EVENT_TRACE
+    # CurrentEvent; TRACE_LOGFILE_HEADER LogfileHeader; a callback pointer; ulong
+    # BufferSize; ulong filled; ulong EventsLost; a callback-pointer union; ulong
+    # IsKernelTrace; pvoid context
+    # x64: CurrentEvent at 32 (88 bytes), LogfileHeader at 120 (280 bytes),
+    # BufferCallback at 400, BufferSize/filled/EventsLost at 408/412/416,
+    # EventRecordCallback 8-aligned at 424, IsKernelTrace 432, context 440, 448 bytes total
     _anonymous_ = ("_mode", "_cb")
     _fields_ = [
         ("LogFileName", wintypes.LPWSTR),
         ("LoggerName", wintypes.LPWSTR),
-        ("CurrentTime", ctypes.c_longlong),
-        ("BuffersRead", ctypes.c_ulong),
+        ("CurrentTime", ctypes.c_int64),
+        ("BuffersRead", ctypes.c_uint32),
         ("_mode", _ProcessTraceModeUnion),
-        ("CurrentEvent", _EVENT_TRACE_OPAQUE),
-        ("LogfileHeader", _TRACE_LOGFILE_HEADER_OPAQUE),
+        ("CurrentEvent", _EVENT_TRACE),
+        ("LogfileHeader", _TRACE_LOGFILE_HEADER),
         ("BufferCallback", ctypes.c_void_p),
-        ("BufferSize", ctypes.c_ulong),
-        ("Filled", ctypes.c_ulong),
-        ("EventsLost", ctypes.c_ulong),
+        ("BufferSize", ctypes.c_uint32),
+        ("Filled", ctypes.c_uint32),
+        ("EventsLost", ctypes.c_uint32),
         ("_cb", _EventCallbackUnion),
-        ("IsKernelTrace", ctypes.c_ulong),
+        ("IsKernelTrace", ctypes.c_uint32),
         ("Context", ctypes.c_void_p),
     ]
 
@@ -363,6 +508,22 @@ _TDH_INTYPE_ANSISTRING = 2
 _TDH_INTYPE_UINT32 = 8
 _TDH_INTYPE_UINT64 = 10
 _TDH_INTYPE_FILETIME = 17
+# learn.microsoft.com/.../ne-tdh-_TDH_IN_TYPE (re-fetched 2026-10-16) declares
+# _TDH_IN_TYPE as a plain 0-based c enum with no explicit values
+# TDH_INTYPE_SID is its 20th member (null=0, unicodestring=1, ansistring=2,
+# int8..uint64=3..10, float=11, double=12, boolean=13, binary=14, guid=15,
+# pointer=16, filetime=17, systemtime=18, sid=19), consistent with the values above
+_TDH_INTYPE_SID = 19
+
+# fixed part of a sid's wire form: ms-dtyp 2.4.2.2 "sid, packet representation"
+# (learn.microsoft.com/.../ms-dtyp/..., fetched 2026-10-16): revision (1 byte),
+# SubAuthorityCount (1 byte, max 15), IdentifierAuthority (6 bytes), then
+# SubAuthorityCount unsigned 32-bit subauthority values
+# total length is 8 + 4 * SubAuthorityCount
+# also winnt.h's sid struct (a "variable-length structure"), which is what
+# win:sid carries per the EventManifest InputType table
+_SID_FIXED_HEADER_SIZE = 8
+_SID_MAX_SUB_AUTHORITIES = 15
 
 # fixed wire widths (bytes) for the scalar in-types this module decodes
 # not derived from EVENT_PROPERTY_INFO.length (only guaranteed nonzero
@@ -445,8 +606,14 @@ def _tdh_decode_event_properties(event_record_ptr):
     decodes a manifest-based event's UserData into {property_name: value}.
     uses TdhGetEventInformation for property metadata (names, in-types,
     fixed lengths), looked up by name and walked in order rather than a
-    fixed byte offset, so this stays correct even if a live build fires a
-    newer template version that only appends fields.
+    fixed byte offset, so this stays correct across template versions
+    whether a newer one appends fields or inserts them mid-template
+    (ProcessStopArgs_V2 inserts ProcessSequenceNumber at position 2,
+    ProcessStart v3's ProcessRundownArgs_V1 inserts several fields,
+    including a variable-length win:sid MandatoryLabel, before ImageName).
+    what by-name walking can't absorb is an in-type this function can't
+    size, TDH_INTYPE_SID is supported for exactly that reason (see its
+    branch below).
 
     deliberately does not call TdhFormatProperty, even though microsoft's
     own guidance for decoding UserData names it. TdhFormatProperty returns
@@ -460,9 +627,10 @@ def _tdh_decode_event_properties(event_record_ptr):
     standard wire encoding: uint32/uint64 are fixed-width little-endian
     integers, filetime is a little-endian 100ns-tick integer (what
     filetime_to_epoch_seconds expects), unicode/AnsiString is a
-    null-terminated string. that's the same approach every etw/tdh
-    consumer takes for primitive types, TdhFormatProperty exists mainly
-    for types this module never needs (maps, arrays, structs, ipv6, ...).
+    null-terminated string, sid is a self-sizing 8 + 4*n byte structure
+    kept as raw bytes. that's the same approach every etw/tdh consumer
+    takes for primitive types, TdhFormatProperty exists mainly for types
+    this module never needs (maps, arrays, structs, ipv6, ...).
 
     an in-type outside this small supported set makes decoding the rest
     of the event's properties unsafe (their byte offsets can't be
@@ -502,6 +670,25 @@ def _tdh_decode_event_properties(event_record_ptr):
                 raise OSError(f"ETW UserData truncated decoding property '{name}' (in-type {in_type})")
             value = int.from_bytes(data[pos:pos + width], "little", signed=False)
             pos += width
+        elif in_type == _TDH_INTYPE_SID:
+            # variable length, self-describing: byte 1 is the sub-authority count n,
+            # total length 8 + 4*n (see _SID_FIXED_HEADER_SIZE)
+            # only skipped, never decoded to a string, nothing downstream needs the
+            # value (ProcessStart v3's MandatoryLabel), only the correct offset of
+            # what follows it
+            if pos + _SID_FIXED_HEADER_SIZE > len(data):
+                raise OSError(f"ETW UserData truncated decoding SID property '{name}'")
+            sub_authority_count = data[pos + 1]
+            if sub_authority_count > _SID_MAX_SUB_AUTHORITIES:
+                raise OSError(
+                    f"malformed SID property '{name}': {sub_authority_count} sub-authorities "
+                    f"(max {_SID_MAX_SUB_AUTHORITIES})"
+                )
+            sid_length = _SID_FIXED_HEADER_SIZE + 4 * sub_authority_count
+            if pos + sid_length > len(data):
+                raise OSError(f"ETW UserData truncated decoding SID property '{name}'")
+            value = data[pos:pos + sid_length]
+            pos += sid_length
         else:
             raise OSError(f"unsupported TDH in-type {in_type} decoding property '{name}'")
 
@@ -509,6 +696,25 @@ def _tdh_decode_event_properties(event_record_ptr):
             result[name] = value
 
     return result
+
+
+def _new_trace_properties_buffer():
+    """
+    a zeroed EVENT_TRACE_PROPERTIES buffer with room for the session name
+    after it, set up the way both StartTraceW and a ControlTraceW stop
+    need it (Wnode.BufferSize, Wnode.Flags = WNODE_FLAG_TRACED_GUID,
+    LoggerNameOffset = sizeof(EVENT_TRACE_PROPERTIES)).
+    LogFileNameOffset is left 0 (no backing file, real-time only) and
+    Wnode.Guid all-zero (etw generates a new session guid).
+    callers set LogFileMode themselves when starting a session.
+    """
+    buffer_size = ctypes.sizeof(_EVENT_TRACE_PROPERTIES) + (_MAXIMUM_SESSION_NAME + _MAX_PATH) * 2
+    props_buf = ctypes.create_string_buffer(buffer_size)
+    props = ctypes.cast(props_buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES)).contents
+    props.Wnode.BufferSize = buffer_size
+    props.Wnode.Flags = _WNODE_FLAG_TRACED_GUID
+    props.LoggerNameOffset = ctypes.sizeof(_EVENT_TRACE_PROPERTIES)
+    return props_buf
 
 
 def _resolve_image_name_and_path(raw_image_name, device_path_map):
@@ -595,14 +801,25 @@ class ProcessMonitor:
         # _handle_etw_process_start/_handle_etw_process_stop mutate image_paths
         # from another thread, iterating it live could raise
         # "dictionary changed size during iteration"
+        # image_paths can legitimately hold none (psutil AccessDenied on exe during
+        # seeding, or an empty etw ImageName), skip those instead of letting
+        # normcase(none) raise TypeError, which on the wfp native-callback path
+        # would otherwise kill attribution silently
         normalized = os.path.normcase(path)
         matches = [
             pid for pid, image_path in list(self.image_paths.items())
-            if os.path.normcase(image_path) == normalized
+            if image_path and os.path.normcase(image_path) == normalized
         ]
         return matches[0] if len(matches) == 1 else None
 
     def _handle_etw_process_start(self, pid, ppid, image_path, create_time, name):
+        # run() starts the etw session before seeding (to close the gap a child
+        # spawned mid-seed would otherwise fall into), so the same live pid can
+        # be reported by both
+        # the first sighting wins, a second one must not emit a duplicate
+        # process_create
+        if pid in self.malware_pids and pid in self.image_paths:
+            return
         self.parent_map[pid] = ppid
         if self.is_descendant(pid, self.root_pid):
             self.malware_pids.add(pid)
@@ -699,24 +916,47 @@ class ProcessMonitor:
         what was fetched/confirmed for each struct, signature, and
         constant used here.
         """
-        buffer_size = ctypes.sizeof(_EVENT_TRACE_PROPERTIES) + (_MAXIMUM_SESSION_NAME + _MAX_PATH) * 2
-        props_buf = ctypes.create_string_buffer(buffer_size)
-        props = ctypes.cast(props_buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES)).contents
-        props.Wnode.BufferSize = buffer_size
-        props.Wnode.Flags = _WNODE_FLAG_TRACED_GUID
-        props.LogFileMode = _EVENT_TRACE_REAL_TIME_MODE
-        props.LoggerNameOffset = ctypes.sizeof(_EVENT_TRACE_PROPERTIES)
-        # LogFileNameOffset left 0: no backing file, real-time only
-        # Wnode.Guid left all-zero: etw generates a new session guid
-
         advapi32 = ctypes.WinDLL("advapi32")
         advapi32.StartTraceW.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_wchar_p, ctypes.c_void_p]
         advapi32.StartTraceW.restype = ctypes.c_ulong
+        advapi32.ControlTraceW.argtypes = [
+            ctypes.c_uint64, ctypes.c_wchar_p, ctypes.c_void_p, ctypes.c_ulong,
+        ]
+        advapi32.ControlTraceW.restype = ctypes.c_ulong
+
+        props_buf = _new_trace_properties_buffer()
+        props = ctypes.cast(props_buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES)).contents
+        props.LogFileMode = _EVENT_TRACE_REAL_TIME_MODE
 
         session_handle = ctypes.c_uint64(0)
         status = advapi32.StartTraceW(
             ctypes.byref(session_handle), _SESSION_NAME, ctypes.cast(props_buf, ctypes.c_void_p),
         )
+        if status == _ERROR_ALREADY_EXISTS:
+            # _SESSION_NAME is fixed, and an etw session outlives the process that
+            # started it (StartTraceW remarks: the session stays active until it's
+            # stopped or the computer restarts)
+            # so a previous run that crashed or was killed before stop() leaves it
+            # running, and every later run would fail here until reboot
+            # StartTraceW's own guidance for this case: clean up the orphaned
+            # session instead of creating a second one
+            # stop it by name (ControlTraceW needs InstanceName when TraceHandle is
+            # 0, a fresh _new_trace_properties_buffer() sets up what a stop needs)
+            # and retry once
+            # a second ERROR_ALREADY_EXISTS (someone else restarted it meanwhile, or
+            # the stop silently failed) falls through to the normal failure path
+            # below instead of looping
+            stale_props_buf = _new_trace_properties_buffer()
+            advapi32.ControlTraceW(
+                0, _SESSION_NAME, ctypes.cast(stale_props_buf, ctypes.c_void_p), _EVENT_TRACE_CONTROL_STOP,
+            )
+            props_buf = _new_trace_properties_buffer()
+            props = ctypes.cast(props_buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES)).contents
+            props.LogFileMode = _EVENT_TRACE_REAL_TIME_MODE
+            session_handle = ctypes.c_uint64(0)
+            status = advapi32.StartTraceW(
+                ctypes.byref(session_handle), _SESSION_NAME, ctypes.cast(props_buf, ctypes.c_void_p),
+            )
         if status != 0:
             raise OSError(f"StartTraceW failed: {status}")
 
@@ -731,7 +971,7 @@ class ProcessMonitor:
         status = advapi32.EnableTraceEx2(
             self._session_handle, ctypes.byref(_KERNEL_PROCESS_PROVIDER_GUID),
             _EVENT_CONTROL_CODE_ENABLE_PROVIDER, _TRACE_LEVEL_INFORMATION,
-            0, 0, 0, None,
+            _WINEVENT_KEYWORD_PROCESS, 0, 0, None,
         )
         if status != 0:
             self._stop_etw_session()
@@ -808,16 +1048,31 @@ class ProcessMonitor:
 
     def run(self):
         self.emit("process", "monitor_start", {"root_pid": self.root_pid})
-        # seeding runs unconditionally, before the trace-session-start attempt,
-        # not nested in the same try/except: a failed etw start must not also
-        # cost us the already-running-process lineage backfill on top of losing
-        # live tracking
-        self._seed_existing_processes()
         self._device_path_map = build_device_path_map()
+        # the etw session starts before seeding: the sample is already running
+        # (popen happens before this thread starts), so seeding first would
+        # leave a window where a child spawned after psutil's enumeration but
+        # before the session went live is never seen, losing its whole subtree
+        # seeding still runs unconditionally, whether the start succeeded or
+        # failed: a failed etw start must not also cost the already-running-
+        # process lineage backfill on top of losing live tracking
+        # a pid seen by both is handled by _handle_etw_process_start's already-
+        # seeded check
         try:
             self._start_etw_session()
+            start_error = None
         except Exception as exc:
-            self.emit("ghostrun_status", "process_monitor_degraded", {"error": str(exc)})
+            start_error = exc
+        try:
+            self._seed_existing_processes()
+        except Exception:
+            # a session that did start must not be leaked by a seeding failure
+            # (it would outlive this process, see _start_etw_session's
+            # ERROR_ALREADY_EXISTS handling)
+            self._stop_etw_session()
+            raise
+        if start_error is not None:
+            self.emit("ghostrun_status", "process_monitor_degraded", {"error": str(start_error)})
             self.emit("process", "monitor_stop", {})
             return
         try:
