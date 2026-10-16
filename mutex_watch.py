@@ -1,7 +1,6 @@
 import ctypes
 import os
 import threading
-import time
 from ctypes import wintypes
 
 from rules_loader import load_rule_file
@@ -252,19 +251,18 @@ class MutexMonitor:
         self._baseline = baseline
         self._degraded_notified = False
         self._scan_lock = threading.Lock()
+        self._wake_event = threading.Event()
 
     def trigger_scan(self):
         """
-        runs one scan immediately, outside the periodic timer.
-        safe to call from another thread. the lock serializes this scan
-        against the periodic run() loop and other triggered scans, so the
-        baseline's read-diff-write never interleaves. it does not make
-        emit() itself safe to raise from: an exception from emit() or
-        classify_mutex_event() still propagates to the caller, same as
-        from run()'s loop.
+        requests one scan as soon as possible, outside the periodic timer.
+        safe to call from another thread. returns immediately, the scan
+        itself runs later on run()'s own thread, not the caller's.
+        several calls arriving before run()'s loop wakes up coalesce into
+        exactly one scan (threading.Event.set() is idempotent), not one
+        scan per call, so a burst of triggers can't queue up a backlog.
         """
-        with self._scan_lock:
-            self._poll_once()
+        self._wake_event.set()
 
     def _poll_once(self):
         current, sources = list_all_named_objects()
@@ -298,12 +296,20 @@ class MutexMonitor:
         try:
             if self._baseline is None:
                 self._baseline, _ = list_all_named_objects()
+            # prime the wake event so the first iteration scans right away
+            # instead of waiting a full poll_interval for its first pass
+            # every iteration after this one waits on a real wake, trigger or timeout, as usual
+            self._wake_event.set()
             while self.running:
-                time.sleep(self.poll_interval)
+                self._wake_event.wait(timeout=self.poll_interval)
+                self._wake_event.clear()
                 if not self.running:
                     break
                 with self._scan_lock:
-                    self._poll_once()
+                    try:
+                        self._poll_once()
+                    except Exception as exc:
+                        self.emit("ghostrun_status", "mutex_scan_failed", {"error": str(exc)})
         finally:
             self.emit("mutex", "monitor_stop", {})
 
