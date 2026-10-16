@@ -383,10 +383,27 @@ def _tdh_string_at(info_buf, offset):
     TRACE_EVENT_INFO's documented "offset from the beginning of this
     structure" convention.
     offset == 0 means "not present" per the same documentation.
+
+    decoded explicitly as utf-16le with a manual 2-byte-nul scan, not
+    via ctypes.wstring_at: wstring_at uses the host's native wchar_t
+    size (2 bytes on windows, 4 on linux/glibc), which silently misreads
+    this buffer on a non-windows host (confirmed by this function's own
+    test failing with a ValueError before this fix). same trap
+    wfp_connection_watcher.py's _decode_app_id already documents and
+    avoids. windows api string data is always utf-16le regardless of
+    host, so decoding explicitly as such is correct everywhere this
+    module actually runs.
     """
     if not offset:
         return None
-    return ctypes.wstring_at(ctypes.addressof(info_buf) + offset)
+    buf_len = ctypes.sizeof(info_buf)
+    if offset >= buf_len:
+        return None
+    raw = ctypes.string_at(ctypes.addressof(info_buf) + offset, buf_len - offset)
+    end = 0
+    while end + 2 <= len(raw) and raw[end:end + 2] != b"\x00\x00":
+        end += 2
+    return raw[:end].decode("utf-16-le")
 
 
 def _tdh_get_event_info(event_record_ptr):
@@ -514,7 +531,6 @@ class ProcessMonitor:
         self.root_pid = root_pid
         self.emit = emit_func
         self.mutex_monitor = mutex_monitor
-        self.running = True
 
         self.parent_map = {}
         self.image_paths = {}  # pid to image path, updated live as descendants appear and exit
@@ -817,5 +833,4 @@ class ProcessMonitor:
             self.emit("process", "monitor_stop", {})
 
     def stop(self):
-        self.running = False
         self._stop_etw_session()
