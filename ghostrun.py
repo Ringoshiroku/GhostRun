@@ -27,9 +27,9 @@ from wfp_connection_watcher import WfpConnectionWatcher
 import atexit
 import signal
 
-# =========================================================
-# UTIL / GLOBAL
-# =========================================================
+# ==========================
+# util / global
+# ==========================
 SENDER = None
 NETWORK_EVENT_COUNT = 0
 persistence = None
@@ -38,6 +38,7 @@ EVIDENCE_QUEUE = queue.Queue()
 ALL_EVIDENCE = []
 network_finding = None
 wfp_watcher = None
+proc_monitor = None
 
 MALWARE_IDENTITY = {
     "pid": None,
@@ -58,14 +59,14 @@ def emit(category, event, data, **meta):
         pid = data.get("pid")
 
     # ===============================
-    # ACTOR-BASED FILTER
+    # actor-based filter
     # ===============================
-    # TEMP: allow svchost/network until injection reasoning siap
+    # temp: allow svchost/network until injection reasoning is ready
     #if category == "network":
     #    pass
     #else:
     #    if pid is not None and pid not in MALWARE_PIDS:
-    #        return     # DROP OS NOISE registry/filesystem
+    #        return     # drop os noise: registry/filesystem
 
     #print(f"[DEBUG] pid : {pid}")
     #print(f"[DEBUG] MALWARE_PIDS : {MALWARE_PIDS}")
@@ -117,6 +118,9 @@ def on_exit():
     # idempotent and safe to call again even if normal teardown already
     # called it (set_filtering_platform_connection_audit only runs when this
     # instance is the one that changed it in the first place)
+    # proc_monitor is stopped on the same paths, for the same reason: its
+    # fixed-name etw session would otherwise outlive this process (see
+    # _stop_native_watchers)
     #
     # safety first: when a sample was actually launched, killing its process
     # tree takes priority over reverting the audit policy
@@ -129,12 +133,8 @@ def on_exit():
     pid = MALWARE_IDENTITY.get("pid")
 
     if not pid:
-        if wfp_watcher is not None:
-            try:
-                wfp_watcher.stop()
-            except Exception:
-                pass
-        return  # sample belum sempat start
+        _stop_native_watchers()
+        return  # sample hasn't started yet
 
     try:
         try:
@@ -169,11 +169,29 @@ def on_exit():
         if failed_pids:
             print(f"[GhostRun] WARNING: failed to confirm termination of PID(s) {failed_pids} on exit")
     finally:
-        if wfp_watcher is not None:
-            try:
-                wfp_watcher.stop()
-            except Exception:
-                pass
+        _stop_native_watchers()
+
+
+def _stop_native_watchers():
+    """
+    stops the two watchers that hold os-level state outliving this process:
+    proc_monitor's etw session (fixed session name; an etw session stays
+    alive until explicitly stopped or reboot, so leaking it breaks every
+    later run's StartTraceW) and wfp_watcher's audit-policy change.
+    each is attempted independently, so one failing never skips the other.
+    both stop() methods are idempotent, so calling this after normal
+    teardown already stopped them is harmless.
+    """
+    if proc_monitor is not None:
+        try:
+            proc_monitor.stop()
+        except Exception:
+            pass
+    if wfp_watcher is not None:
+        try:
+            wfp_watcher.stop()
+        except Exception:
+            pass
 
 def sender_worker():
     while True:
@@ -224,9 +242,9 @@ def send_backup_file(file):
   
 
     
-# =========================================================
-# MAIN CONTROLLER
-# =========================================================
+# ==============================
+# main controller
+# ==============================
 def main():
     parser = argparse.ArgumentParser(description="GhostRun v1 – See the Unseen")
     parser.add_argument("-s", "--sample", required=True, help="Path to EXE sample")
@@ -238,7 +256,7 @@ def main():
 
     print("[GhostRun] Starting controller")
 
-    global persistence, network_infer, network_finding, wfp_watcher
+    global persistence, network_infer, network_finding, wfp_watcher, proc_monitor
 
     FS_TARGETS = {
         "TEMP": os.environ.get("TEMP"),
@@ -257,15 +275,15 @@ def main():
         "WINDOWS_TEMP": r"C:\Windows\Temp",
     }
         
-    # execute persistence detector
+    # run the persistence detector
     persistence = PersistenceDetector()
     
     network_infer = NetworkInferenceDetector(args.sample)
     static_net = StaticNetworkIndicatorDetector(args.sample)
 
     # -----------------------------------------------------
-    # 1️⃣ Init Evidence Sender
-    # -----------------------------------------------------    
+    # 1. init evidence sender
+    # -----------------------------------------------------
     global SENDER
     case_id = f"ghostrun-{int(time.time())}"
     
@@ -290,7 +308,7 @@ def main():
 
 
     # -----------------------------------------------------
-    # 2️⃣ Snapshot BEFORE
+    # 2. snapshot before
     # -----------------------------------------------------
     print(f"[GhostRun] Registry snapshot: BEFORE")
     reg_before = snapshot_registry()
@@ -421,7 +439,7 @@ def main():
         sys.exit(1)
 
     # -----------------------------------------------------
-    # 4️⃣ Start monitors (THREADING)
+    # 4. start monitors (threading)
     # -----------------------------------------------------
     sender_thread = threading.Thread(
         target=sender_worker,
@@ -497,7 +515,7 @@ def main():
     print("[GhostRun] Monitoring started")
     
     # -----------------------------------------------------
-    # 5️⃣ Run until timeout
+    # 5. run until timeout
     # -----------------------------------------------------
     time.sleep(args.timeout)
 
@@ -510,7 +528,7 @@ def main():
     kill_process_tree(ROOTPID, emit, trigger="timeout", expected_create_time=MALWARE_IDENTITY.get("create_time"))
 
     # -----------------------------------------------------
-    # 6️⃣ Snapshot AFTER
+    # 6. snapshot after
     # -----------------------------------------------------
     print(f"[GhostRun] Registry snapshot (PID {ROOTPID}): AFTER")
     reg_after = snapshot_registry()
@@ -540,16 +558,23 @@ def main():
     fs_watcher.stop()
 
     # -----------------------------------------------------
-    # 7️⃣ Stop monitors cleanly
+    # 7. stop monitors cleanly
     # -----------------------------------------------------
     proc_monitor.stop()
     persistence_watcher.stop()
     # one final triggered scan to catch anything created in the sample's
     # last moments, before the monitor thread stops
-    # guarded the same way ProcessMonitor._trigger_mutex_scan() guards this
-    # exact call: a failure here must not skip the rest of teardown below it
-    # (stop(), wfp_watcher.stop()'s audit-policy revert, the thread joins,
-    # and the pcap/suricata analysis)
+    # trigger_scan() is non-blocking, it just flags a request and wakes
+    # run()'s thread
+    # MutexMonitor.run() honors a trigger still pending when stop() lands,
+    # with one last scan before exiting, so calling stop() right after is safe
+    # a scan failure surfaces as mutex_scan_failed from run()'s own thread
+    # mutex_thread.join() below is what waits for that scan
+    # the try/except is only defense in depth for teardown itself
+    # (trigger_scan() just sets a flag and an event)
+    # nothing here may skip the rest of teardown below (stop(),
+    # wfp_watcher.stop()'s audit-policy revert, the thread joins, and the
+    # pcap/suricata analysis)
     try:
         mutex_monitor.trigger_scan()
     except Exception as exc:
@@ -649,7 +674,7 @@ def main():
     dump_local_evidence(args.file)
     send_backup_file(args.file)
 
-    # Stop sender
+    # stop sender
     EVIDENCE_QUEUE.put(None)
     sender_thread.join(timeout=5)
 

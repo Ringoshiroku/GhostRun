@@ -252,6 +252,11 @@ class MutexMonitor:
         self._degraded_notified = False
         self._scan_lock = threading.Lock()
         self._wake_event = threading.Event()
+        # set by trigger_scan(), cleared when a scan starts
+        # kept separate from _wake_event because stop() also sets the wake event
+        # to wake run() promptly, so the wake event alone can't tell run()
+        # whether a trigger is still owed a scan when running=False
+        self._scan_requested = False
 
     def trigger_scan(self):
         """
@@ -261,8 +266,19 @@ class MutexMonitor:
         several calls arriving before run()'s loop wakes up coalesce into
         exactly one scan (threading.Event.set() is idempotent), not one
         scan per call, so a burst of triggers can't queue up a backlog.
+        a trigger still pending when stop() is called gets one final
+        scan before run() exits (teardown relies on this last-chance scan).
         """
+        self._scan_requested = True
         self._wake_event.set()
+
+    def _scan(self):
+        self._scan_requested = False
+        with self._scan_lock:
+            try:
+                self._poll_once()
+            except Exception as exc:
+                self.emit("ghostrun_status", "mutex_scan_failed", {"error": str(exc)})
 
     def _poll_once(self):
         current, sources = list_all_named_objects()
@@ -300,18 +316,19 @@ class MutexMonitor:
             # instead of waiting a full poll_interval for its first pass
             # every iteration after this one waits on a real wake, trigger or timeout, as usual
             self._wake_event.set()
-            while self.running:
+            while True:
                 self._wake_event.wait(timeout=self.poll_interval)
                 self._wake_event.clear()
                 if not self.running:
+                    # a trigger_scan() that landed before or with stop() is still owed its scan
+                    # run it once, then exit
+                    if self._scan_requested:
+                        self._scan()
                     break
-                with self._scan_lock:
-                    try:
-                        self._poll_once()
-                    except Exception as exc:
-                        self.emit("ghostrun_status", "mutex_scan_failed", {"error": str(exc)})
+                self._scan()
         finally:
             self.emit("mutex", "monitor_stop", {})
 
     def stop(self):
         self.running = False
+        self._wake_event.set()  # wake run() now instead of waiting up to poll_interval
