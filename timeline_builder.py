@@ -13,7 +13,9 @@ class TimelineBuilder:
         r"api-ms-win-",
         r"vcruntime",
         r"ucrt"
-    ]    
+    ]
+
+    _UNRESOLVED_ATTRIBUTION_TIER = {"high": "medium", "medium": "low", "low": "low"}
 
     def __init__(self, evidences):
         self.evidences = evidences
@@ -147,9 +149,15 @@ class TimelineBuilder:
                     or data.get("service") or data.get("raddr")
                 )
                 if value:
+                    confidence = ev.get("confidence", "low")
+                    # not confirmed to a specific malware process, only the
+                    # capture-wide fallback tied it to the sample: one tier lower.
+                    # absent/"resolved" keeps the tier.
+                    if data.get("attribution_confidence") == "unknown":
+                        confidence = self._UNRESOLVED_ATTRIBUTION_TIER.get(confidence, confidence)
                     self._add_ioc(
                         "network_finding", value,
-                        confidence=ev.get("confidence", "low"), source="network_behavior",
+                        confidence=confidence, source="network_behavior",
                     )
 
         return dict(self.iocs)

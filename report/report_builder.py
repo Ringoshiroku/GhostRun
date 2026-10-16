@@ -423,7 +423,18 @@ class MarkdownReportBuilder:
                 pid = data.get("pid")
 
                 #desc = f"Outbound network activity from malware PID {pid} ({name}) to {raddr}"
-                desc = f"Outbound network activity from malware PID {pid} to {raddr}"
+                # attribution_confidence (see network_finding_engine.py) is
+                # "unknown" when the connection was only tied to the sample by
+                # the capture-wide fallback, not a specific process.
+                # don't phrase that as confirmed traffic from this PID.
+                # absent (older evidence) keeps the original phrasing.
+                if data.get("attribution_confidence") == "unknown":
+                    desc = (
+                        f"Outbound network activity to {raddr} (unresolved attribution: "
+                        f"observed during the run, not confirmed to a specific malware process)"
+                    )
+                else:
+                    desc = f"Outbound network activity from malware PID {pid} to {raddr}"
 
                 if data.get("service"):
                     desc += f" [{data.get('service')}]"
