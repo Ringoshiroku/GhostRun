@@ -1,8 +1,154 @@
+import collections
 import ctypes
 import threading
 from ctypes import wintypes
 
 from audit_policy import query_filtering_platform_connection_audit, set_filtering_platform_connection_audit
+from native_paths import build_device_path_map, filetime_to_epoch_seconds, to_dos_path
+
+_MAX_TRACKED_EVENTS = 10000
+
+
+# wfp native struct/enum declarations.
+#
+# verification status (fetched 2026-10-16):
+# - FWP_BYTE_BLOB, fwpm_net_event_header3, fwpm_net_event_subscription0,
+#   FwpmEngineOpen0, FwpmNetEventSubscribe4, FwpmNetEventUnsubscribe0,
+#   FwpmEngineClose0: confirmed against learn.microsoft.com's fwpmtypes
+#   and fwpmu pages before this session, used as given.
+# - FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW's value and
+#   fwpm_net_event_callback4's parameter order: confirmed this session,
+#   see each definition's own comment below.
+# - appId's content encoding: not confirmed despite checking several
+#   microsoft pages, see _decode_app_id's docstring for the full story.
+
+
+class _FWP_BYTE_BLOB(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("data", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+class _FWP_BYTE_ARRAY16(ctypes.Structure):
+    _fields_ = [("byteArray16", ctypes.c_ubyte * 16)]
+
+
+class _LocalAddrUnion(ctypes.Union):
+    _fields_ = [("localAddrV4", ctypes.c_uint32), ("localAddrV6", _FWP_BYTE_ARRAY16)]
+
+
+class _RemoteAddrUnion(ctypes.Union):
+    _fields_ = [("remoteAddrV4", ctypes.c_uint32), ("remoteAddrV6", _FWP_BYTE_ARRAY16)]
+
+
+class _FWPM_NET_EVENT_HEADER3(ctypes.Structure):
+    # confirmed against learn.microsoft.com's fwpm_net_event_header3 page,
+    # fetched 2026-10-16.
+    _anonymous_ = ("_local", "_remote")
+    _fields_ = [
+        ("timeStamp", wintypes.FILETIME),
+        ("flags", ctypes.c_uint32),
+        ("ipVersion", ctypes.c_int),
+        ("ipProtocol", ctypes.c_uint8),
+        ("_local", _LocalAddrUnion),
+        ("_remote", _RemoteAddrUnion),
+        ("localPort", ctypes.c_uint16),
+        ("remotePort", ctypes.c_uint16),
+        ("scopeId", ctypes.c_uint32),
+        ("appId", _FWP_BYTE_BLOB),
+        ("userId", ctypes.c_void_p),       # *sid is opaque here, never dereferenced
+        ("addressFamily", ctypes.c_int),
+        ("packageSid", ctypes.c_void_p),   # *sid is opaque here, never dereferenced
+        ("enterpriseId", ctypes.c_wchar_p),
+        ("policyFlags", ctypes.c_uint64),
+        ("effectiveName", _FWP_BYTE_BLOB),
+    ]
+
+
+class _FWPM_NET_EVENT5(ctypes.Structure):
+    # named fwpm_net_event5, not fwpm_net_event4: learn.microsoft.com's
+    # fwpm_net_event_callback4 page (fetched 2026-10-16) shows the real
+    # callback signature takes a fwpm_net_event5*.
+    # fwpm_net_event5 has the same layout as fwpm_net_event4 (header, type,
+    # union of payload pointers) plus one extra union member at the end, so
+    # header/type offsets don't move. this is a naming fix, not a layout
+    # change.
+    # the union is declared below as one generic void pointer instead of
+    # every payload struct: this module only reads header.appId,
+    # header.localPort, header.timeStamp, and the type discriminant, so
+    # anything more would be guessed surface area for no benefit.
+    _fields_ = [
+        ("header", _FWPM_NET_EVENT_HEADER3),
+        ("type", ctypes.c_int),
+        ("data", ctypes.c_void_p),
+    ]
+
+
+class _GUID(ctypes.Structure):
+    # ctypes.wintypes.GUID doesn't exist, confirmed empirically
+    # (AttributeError on this dev host; wintypes.py is pure python on every
+    # platform, so it's missing everywhere, not just here).
+    # this is the standard 16-byte win32 guid layout from guiddef.h,
+    # unchanged since win32 introduced it and used the same way by every
+    # ctypes codebase that needs one (comtypes, pywin32, etc.).
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_uint8 * 8),
+    ]
+
+
+class _FWPM_NET_EVENT_SUBSCRIPTION0(ctypes.Structure):
+    # confirmed against fwpm_net_event_subscription0's page, fetched
+    # 2026-10-16. enumTemplate=null matches all net events.
+    # this module relies on audit_policy.py's success-audit gating, not an
+    # enum template filter, to restrict what actually reaches it.
+    _fields_ = [
+        ("enumTemplate", ctypes.c_void_p),
+        ("flags", ctypes.c_uint32),
+        ("sessionKey", _GUID),
+    ]
+
+
+# confirmed against fwpm_net_event_type's page, fetched 2026-10-16: the
+# enum is 0-based in this exact order, and CLASSIFY_ALLOW is 6, matching
+# what was already used here.
+_FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW = 6
+
+
+def _decode_app_id(byte_blob, device_path_map):
+    """
+    decodes a wfp appid blob (FWPM_NET_EVENT_HEADER3.appId) into a
+    dos-form file path, or none if the blob is unset.
+
+    appid's content encoding isn't confirmed by any microsoft source
+    checked (the header page, fwp_condition_value0,
+    FwpmGetAppIdFromFileName0, the official sample, and a broader web
+    search). decoding it as nul-terminated utf-16 matches common wfp
+    developer convention, but it's still an assumption, not a verified
+    fact.
+
+    this is a bounded-risk assumption though, not a struct-layout guess:
+    FWP_BYTE_BLOB's {size, data} shape is verified, and this function
+    only reads exactly `size` bytes, so a wrong encoding can't corrupt
+    memory. worst case is a garbled path string, which downstream code
+    already treats safely as a non-match. confirm against a live capture
+    before trusting app_path attribution in production.
+    """
+    if not byte_blob.size or not byte_blob.data:
+        return None
+    try:
+        raw_bytes = ctypes.string_at(ctypes.addressof(byte_blob.data.contents), byte_blob.size)
+        # decoded explicitly as utf-16-le instead of ctypes.wstring_at.
+        # wstring_at uses the host's native wchar_t size, 2 bytes on windows but
+        # 4 on linux/glibc, so it would misread this buffer on a non-windows
+        # host (confirmed while writing this function's test).
+        # windows api strings are always utf-16le regardless of host, so
+        # decoding explicitly avoids that trap and is correct everywhere this
+        # module runs.
+        app_path = raw_bytes.decode("utf-16-le").rstrip("\x00")
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return to_dos_path(app_path, device_path_map)
 
 
 class WfpConnectionWatcher:
@@ -21,9 +167,11 @@ class WfpConnectionWatcher:
         self.emit = emit_func
         self._audit_policy_changed = False
         self._events_lock = threading.Lock()
-        self._events = []  # [(timestamp, local_port, resolved_pid_or_none)]
+        self._events = collections.deque(maxlen=_MAX_TRACKED_EVENTS)  # [(timestamp, local_port, resolved_pid_or_none)]
         self._engine_handle = None
         self._subscription_handle = None
+        self._callback_ref = None  # keeps the ctypes callback alive, see _native_start
+        self._device_path_map = None
 
     def start(self):
         """
@@ -128,37 +276,91 @@ class WfpConnectionWatcher:
         opens the wfp engine handle and subscribes to CLASSIFY_ALLOW net
         events, decoding each into a call to self._on_event().
         returns true on success, false on any failure, never raises.
+        start() already wraps this call in try/except as defense in
+        depth, but this method also returns false itself on a documented
+        failure rather than relying only on that wrapper.
 
-        not implemented on purpose, not an oversight. the real
-        ctypes bindings need the exact verified field order, types,
-        and size of several wfp structs and the callback signature,
-        the same way mutex_watch.py's _OBJECT_DIRECTORY_INFORMATION
-        comment documents its own verified source.
-        this environment can't browse microsoft's reference pages to
-        verify that layout, and guessing one from memory risks memory
-        corruption or a segfault against the real windows api, worse
-        than an honest NotImplementedError.
-        every test that exercises start() replaces this method via
-        monkeypatch and never reaches this body.
+        struct/enum layout verified against learn.microsoft.com's
+        fwpmtypes/fwpmu pages, see the module-level comment above
+        _FWP_BYTE_BLOB and each struct's own comment for what was
+        checked and when. only reachable on a real windows host, every
+        test that exercises start() replaces this method via monkeypatch,
+        except the live-windows-only
+        test_wfp_unsubscribe_and_close_succeeds_on_live_windows.
+
+        ctypes.WINFUNCTYPE is built here, not at module level, because
+        it doesn't exist at all on a non-windows host (confirmed
+        empirically, same as ctypes.WinDLL). building it eagerly at
+        import time would break importing this module on every
+        non-windows host, which is exactly the degrade contract every
+        other optional native capability here avoids breaking.
         """
-        raise NotImplementedError(
-            "WFP ctypes bindings: implement against the struct layout verified "
-            "against Microsoft's official fwpmtypes/fwpmu reference pages (see "
-            "this task's brief), not a guess, then record the Windows build it "
-            "was verified against in a comment here. Only reachable on a real "
-            "Windows host with the real wfp_connection_watcher module imported; "
-            "every test above replaces this method entirely."
+        fwpuclnt = ctypes.WinDLL("Fwpuclnt")
+
+        engine_handle = wintypes.HANDLE()
+        status = fwpuclnt.FwpmEngineOpen0(None, 1, None, None, ctypes.byref(engine_handle))  # RPC_C_AUTHN_WINNT = 1
+        if status != 0:
+            return False
+
+        self._device_path_map = build_device_path_map()
+
+        callback_type = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_FWPM_NET_EVENT5))
+
+        def _callback(context, net_event_ptr):
+            net_event = net_event_ptr.contents
+            if net_event.type != _FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW:
+                return
+            header = net_event.header
+            app_path = _decode_app_id(header.appId, self._device_path_map)
+            timestamp = filetime_to_epoch_seconds(
+                header.timeStamp.dwLowDateTime | (header.timeStamp.dwHighDateTime << 32)
+            )
+            self._on_event(timestamp=timestamp, local_port=header.localPort, app_path=app_path)
+
+        self._callback_ref = callback_type(_callback)  # keeps this alive, ctypes doesn't hold its own reference
+
+        subscription = _FWPM_NET_EVENT_SUBSCRIPTION0()
+        events_handle = wintypes.HANDLE()
+        status = fwpuclnt.FwpmNetEventSubscribe4(
+            engine_handle, ctypes.byref(subscription), self._callback_ref, None, ctypes.byref(events_handle)
         )
+        if status != 0:
+            fwpuclnt.FwpmEngineClose0(engine_handle)
+            return False
+
+        self._engine_handle = engine_handle
+        self._subscription_handle = events_handle
+        return True
 
     def _native_stop(self):
         """
-        unsubscribes and closes the engine handle. never raises.
-
-        not implemented, same reason as _native_start above: needs to be
-        built together with it, against the same verified struct layout
-        and the matching unsubscribe/close calls.
+        unsubscribes and closes the engine handle.
+        idempotent: calling this when _engine_handle is already none
+        (never started, or already stopped) is a no-op instead of trying
+        to re-close an already-closed or never-opened handle.
         """
-        raise NotImplementedError(
-            "WFP ctypes teardown: implement alongside _native_start, against "
-            "the same verified struct layout."
-        )
+        if self._engine_handle is None:
+            return
+        _wfp_unsubscribe_and_close(self._engine_handle, self._subscription_handle)
+        self._engine_handle = None
+        self._subscription_handle = None
+
+
+def _wfp_unsubscribe_and_close(engine_handle, subscription_handle):
+    """
+    raw native teardown, split out of _native_stop so the idempotency
+    guard above it is testable on this non-windows host without needing
+    ctypes.WinDLL to exist.
+    calls FwpmNetEventUnsubscribe0 then FwpmEngineClose0, both confirmed
+    against learn.microsoft.com. only reachable on a real windows host
+    with real handles. every test above replaces this function via
+    monkeypatch to test _native_stop's guard logic, except the
+    live-windows test test_wfp_unsubscribe_and_close_succeeds_on_live_windows.
+    """
+    fwpuclnt = ctypes.WinDLL("Fwpuclnt")
+    status = fwpuclnt.FwpmNetEventUnsubscribe0(engine_handle, subscription_handle)
+    if status != 0:
+        raise OSError(f"FwpmNetEventUnsubscribe0 failed: {status}")
+    status = fwpuclnt.FwpmEngineClose0(engine_handle)
+    if status != 0:
+        raise OSError(f"FwpmEngineClose0 failed: {status}")
