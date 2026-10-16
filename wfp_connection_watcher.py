@@ -172,6 +172,7 @@ class WfpConnectionWatcher:
         self._subscription_handle = None
         self._callback_ref = None  # keeps the ctypes callback alive, see _native_start
         self._device_path_map = None
+        self._callback_failure_notified = False
 
     def start(self):
         """
@@ -271,6 +272,41 @@ class WfpConnectionWatcher:
         with self._events_lock:
             self._events.append((timestamp, local_port, resolved_pid))
 
+    def _handle_native_event(self, net_event_ptr):
+        """
+        body of the native wfp callback (see _native_start), kept as a
+        method so it's testable without ctypes.WINFUNCTYPE.
+        never lets an exception escape: ctypes silently swallows one
+        raised inside a native callback, so an unguarded failure here
+        (a decode error, a resolve_path_to_pid bug) would drop events
+        with no trail at all.
+        same contract as ProcessMonitor._etw_event_record_callback,
+        except the degrade status is only emitted on the first failure.
+        wfp fires per connection, so a systematic failure would otherwise
+        flood the evidence stream with one status event per connection.
+        later events are still attempted normally, so one bad event
+        doesn't cost the rest of the run.
+        """
+        try:
+            net_event = net_event_ptr.contents
+            if net_event.type != _FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW:
+                return
+            header = net_event.header
+            app_path = _decode_app_id(header.appId, self._device_path_map)
+            timestamp = filetime_to_epoch_seconds(
+                header.timeStamp.dwLowDateTime | (header.timeStamp.dwHighDateTime << 32)
+            )
+            self._on_event(timestamp=timestamp, local_port=header.localPort, app_path=app_path)
+        except Exception as exc:
+            if not self._callback_failure_notified:
+                self._callback_failure_notified = True
+                try:
+                    self.emit("ghostrun_status", "wfp_watcher_degraded", {
+                        "reason": f"WFP event handling failed: {type(exc).__name__}: {exc}",
+                    })
+                except Exception:
+                    pass
+
     def _native_start(self):
         """
         opens the wfp engine handle and subscribes to CLASSIFY_ALLOW net
@@ -307,15 +343,7 @@ class WfpConnectionWatcher:
         callback_type = ctypes.WINFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(_FWPM_NET_EVENT5))
 
         def _callback(context, net_event_ptr):
-            net_event = net_event_ptr.contents
-            if net_event.type != _FWPM_NET_EVENT_TYPE_CLASSIFY_ALLOW:
-                return
-            header = net_event.header
-            app_path = _decode_app_id(header.appId, self._device_path_map)
-            timestamp = filetime_to_epoch_seconds(
-                header.timeStamp.dwLowDateTime | (header.timeStamp.dwHighDateTime << 32)
-            )
-            self._on_event(timestamp=timestamp, local_port=header.localPort, app_path=app_path)
+            self._handle_native_event(net_event_ptr)
 
         self._callback_ref = callback_type(_callback)  # keeps this alive, ctypes doesn't hold its own reference
 
