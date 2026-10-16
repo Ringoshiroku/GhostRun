@@ -68,8 +68,22 @@ class NetworkFindingEngine:
         if _is_known_benign(hostname):
             return
 
+        # three-way attribution: "resolved" only when pid_attribution is
+        # exactly _RESOLVED_PID_NOTE. anything else, the fallback note, a
+        # missing key, a future third value, counts as "unknown".
+        attribution_confidence = "resolved" if data.get("pid_attribution") == _RESOLVED_PID_NOTE else "unknown"
+
         key = (raddr, hostname, data.get("url"))
+        # dedup keeps whichever event arrives first, but attribution can
+        # differ per event since resolution is per-connection: an early
+        # "unknown" can later get a "resolved" for the same destination.
+        # a duplicate carrying "resolved" upgrades the stored finding's tag.
+        # it never downgrades a tag, and never adds a new entry.
         if key in self._seen:
+            self._upgrade_attribution(
+                attribution_confidence,
+                lambda f: (f.get("raddr"), f.get("hostname"), f.get("url")) == key,
+            )
             return
         # flow_summary has no hostname/url, so it won't match the _seen key
         # above when a tls_connection/http_request for the same destination
@@ -77,13 +91,12 @@ class NetworkFindingEngine:
         if event == "flow_summary" and raddr is not None and any(
             f.get("raddr") == raddr for f in self.findings
         ):
+            self._upgrade_attribution(
+                attribution_confidence,
+                lambda f: f.get("raddr") == raddr,
+            )
             return
         self._seen.add(key)
-
-        # three-way attribution: "resolved" only when pid_attribution is
-        # exactly _RESOLVED_PID_NOTE. anything else, the fallback note, a
-        # missing key, a future third value, counts as "unknown".
-        attribution_confidence = "resolved" if data.get("pid_attribution") == _RESOLVED_PID_NOTE else "unknown"
 
         self.findings.append({
             "pid": pid,
@@ -97,6 +110,13 @@ class NetworkFindingEngine:
             "severity": data.get("severity"),
             "attribution_confidence": attribution_confidence,
         })
+
+    def _upgrade_attribution(self, confidence, matches):
+        if confidence != "resolved":
+            return
+        for f in self.findings:
+            if matches(f):
+                f["attribution_confidence"] = "resolved"
 
     def analyze(self, emit):
         for f in list(self.findings):
