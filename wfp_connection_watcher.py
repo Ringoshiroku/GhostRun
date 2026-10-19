@@ -8,6 +8,17 @@ from native_paths import build_device_path_map, filetime_to_epoch_seconds, to_do
 
 _MAX_TRACKED_EVENTS = 10000
 
+# confirmed against learn.microsoft.com's rpc authentication-service
+# constants page, fetched 2026-10-19: RPC_C_AUTHN_WINNT = 10.
+# the value used here before (1) is actually RPC_C_AUTHN_DCE_PRIVATE, a
+# stale comment had mislabeled it as RPC_C_AUTHN_WINNT.
+# FwpmEngineOpen0's docs only allow RPC_C_AUTHN_WINNT or
+# RPC_C_AUTHN_DEFAULT, so the wrong value deterministically explains the
+# ERROR_NOT_SUPPORTED (0x32) a live windows run hit every time, on a
+# host confirmed to have the right service and audit-policy state
+# already, ruling out an environment cause.
+_RPC_C_AUTHN_WINNT = 10
+
 
 # wfp native struct/enum declarations.
 #
@@ -357,7 +368,7 @@ class WfpConnectionWatcher:
         fwpuclnt.FwpmEngineClose0.restype = wintypes.DWORD
 
         engine_handle = wintypes.HANDLE()
-        status = fwpuclnt.FwpmEngineOpen0(None, 1, None, None, ctypes.byref(engine_handle))  # RPC_C_AUTHN_WINNT = 1
+        status = fwpuclnt.FwpmEngineOpen0(None, _RPC_C_AUTHN_WINNT, None, None, ctypes.byref(engine_handle))
         if status != 0:
             # raises instead of returning false, matching
             # _wfp_unsubscribe_and_close's pattern, so start()'s emitted
