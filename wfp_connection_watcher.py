@@ -188,6 +188,11 @@ class WfpConnectionWatcher:
         self._callback_ref = None  # keeps the ctypes callback alive, see _native_start
         self._device_path_map = None
         self._callback_failure_notified = False
+        self._thread = None
+        self._stop_event = threading.Event()
+        self._started_event = threading.Event()
+        self._native_start_result = False
+        self._native_start_error = None
 
     def start(self):
         """
@@ -196,66 +201,148 @@ class WfpConnectionWatcher:
         remembers whether this instance was the one that flipped it, so
         stop() only restores a setting it actually changed, never an
         existing operator setting.
-        then tries the native wfp subscription. on failure, whether a
-        false return or a raised exception (today's NotImplementedError
-        stub, or a real failure later), degrades to an emitted status
-        event instead of raising or crashing the caller, same as every
-        other optional capability in this codebase.
-        also reverts the audit-policy flip before returning on that path:
-        a watcher that never actually started shouldn't leave the host's
-        audit policy changed, especially since a caller that treats a
-        degraded start as "never ran" has no reason to call stop().
+        then runs the native wfp subscription attempt on a dedicated
+        thread (see _run_native_session) and waits for it to report
+        success or failure, so this method keeps the same synchronous
+        success/failure contract as before. the dedicated thread is just
+        an implementation detail, not a behavior change.
+        on failure, whether a false return or a raised exception,
+        degrades to an emitted status event instead of raising or
+        crashing the caller, same as every other optional capability
+        here. also reverts the audit-policy flip before returning on
+        that path, so a watcher that never actually started doesn't
+        leave the host's audit policy changed.
+
+        uses a dedicated thread instead of fire-and-forget because a
+        live windows run showed FwpmEngineOpen0/FwpmNetEventSubscribe4
+        both succeeding, with the right service and audit state
+        confirmed, yet the native callback never fired once despite real
+        traffic during the run. every other watcher in this codebase
+        keeps a dedicated thread alive for its whole subscription
+        lifetime, not just the initial open/subscribe call. this was the
+        one exception. see _run_native_session's docstring for why it
+        also initializes com on that thread.
         """
         was_enabled = query_filtering_platform_connection_audit()
         if was_enabled is False:
             if set_filtering_platform_connection_audit(True):
                 self._audit_policy_changed = True
 
-        try:
-            native_started = self._native_start()
-            native_start_error = None
-        except Exception as exc:
-            native_started = False
-            native_start_error = str(exc)
+        self._stop_event.clear()
+        self._started_event.clear()
+        self._thread = threading.Thread(target=self._run_native_session, daemon=True, name="WfpConnectionWatcher")
+        self._thread.start()
+        self._started_event.wait(timeout=10)
 
-        if not native_started:
+        if not self._native_start_result:
             self._revert_audit_policy_if_changed()
             reason = "WFP engine open or event subscription failed"
-            if native_start_error:
-                # native_start_error names which call failed and with what status
+            if self._native_start_error:
+                # _native_start_error names which call failed and with what status
                 # code, see _native_start.
                 # a live run that only surfaced the generic reason above, with no way
                 # to tell FwpmEngineOpen0 apart from FwpmNetEventSubscribe4 or see the
                 # actual status, left nothing to actually diagnose.
-                reason = f"{reason}: {native_start_error}"
+                reason = f"{reason}: {self._native_start_error}"
             self.emit("ghostrun_status", "wfp_watcher_degraded", {
                 "reason": reason,
             })
             return
 
+    def _run_native_session(self):
+        """
+        runs on its own dedicated thread for the subscription's whole
+        lifetime, see start()'s docstring for why this thread exists.
+        pythoncom.CoInitialize() mirrors the same fix
+        persistence_watch.py's wmi watcher already needed for the same
+        class of windows com/rpc callback-delivery api, see its comment:
+        com must be initialized on a thread before its first com call,
+        or the call raises a com_error and the thread dies.
+        microsoft's FwpmNetEventSubscribe4 docs don't mention any
+        com/threading requirement, so this is a reasoned, precedented
+        hypothesis applied to a different api, not a confirmed root
+        cause for wfp specifically. it's safe and harmless to try even
+        if unnecessary, coinitialize/CoUninitialize on a thread that
+        never needed them is a documented no-op-ish pairing, not a
+        corruption risk.
+        """
+        pythoncom = None
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()
+        except ImportError:
+            # pythoncom (part of pywin32) isn't installed on this platform, e.g.
+            # this non-windows dev/test host. nothing to initialize.
+            pythoncom = None
+
+        try:
+            self._native_start_result = self._native_start()
+            self._native_start_error = None
+        except Exception as exc:
+            self._native_start_result = False
+            self._native_start_error = str(exc)
+        finally:
+            self._started_event.set()
+
+        if not self._native_start_result:
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
+            return
+
+        try:
+            # kept alive for as long as the subscription needs to keep delivering
+            # events. PumpWaitingMessages drains any queued window-message-based
+            # delivery, in case that's how this api delivers callbacks (undocumented
+            # either way). the bounded wait keeps this loop from busy-spinning
+            # regardless.
+            while not self._stop_event.is_set():
+                if pythoncom is not None:
+                    try:
+                        pythoncom.PumpWaitingMessages()
+                    except Exception:
+                        pass
+                self._stop_event.wait(timeout=0.2)
+        finally:
+            try:
+                self._native_stop()
+            except Exception:
+                pass
+            if pythoncom is not None:
+                pythoncom.CoUninitialize()
+
     def stop(self):
-        # reported only when this watcher actually started a session
-        # (self._engine_handle is set).
+        """
+        signals the dedicated thread, if one is running, to exit its
+        pump loop, and waits for it to finish.
+        that thread's own finally block is what actually calls
+        _native_stop() and CoUninitialize(), on the same thread that
+        opened/subscribed and called CoInitialize(), since com requires
+        init/uninit on the same thread.
+        a bounded join timeout keeps this method from hanging forever if
+        the thread is stuck. the thread is a daemon thread either way,
+        so it can't block process exit.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            self._stop_event.set()
+            self._thread.join(timeout=10)
+
+        # reported only when this watcher actually started a session.
+        # checks self._native_start_result instead of self._engine_handle,
+        # since the thread's own _native_stop() call already clears that to
+        # none by the time join() returns.
         # a live run where _native_start succeeds (no wfp_watcher_degraded) but
         # every network event still comes back unresolved gives no way to tell,
         # from the evidence alone, whether the native callback never fired at
         # all, or fired and every app-path resolution just failed.
         # this number answers that directly on the next run, instead of another
         # guess-and-check round.
-        if self._engine_handle is not None:
+        if self._native_start_result:
             with self._events_lock:
                 event_count = len(self._events)
             self.emit("ghostrun_status", "wfp_watcher_summary", {
                 "events_recorded": event_count,
             })
 
-        # best-effort teardown.
-        # a failing or raising _native_stop() (e.g. today's NotImplementedError
-        # stub) must not stop the audit-policy restore below from running.
-        try:
-            self._native_stop()
-        except Exception:
-            pass
         self._revert_audit_policy_if_changed()
 
     def _revert_audit_policy_if_changed(self):
