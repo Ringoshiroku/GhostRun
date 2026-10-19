@@ -13,10 +13,14 @@ _MAX_TRACKED_EVENTS = 10000
 # the value used here before (1) is actually RPC_C_AUTHN_DCE_PRIVATE, a
 # stale comment had mislabeled it as RPC_C_AUTHN_WINNT.
 # FwpmEngineOpen0's docs only allow RPC_C_AUTHN_WINNT or
-# RPC_C_AUTHN_DEFAULT, so the wrong value deterministically explains the
-# ERROR_NOT_SUPPORTED (0x32) a live windows run hit every time, on a
-# host confirmed to have the right service and audit-policy state
-# already, ruling out an environment cause.
+# RPC_C_AUTHN_DEFAULT, so this was passing a documented-invalid value on
+# every call.
+# that's the most likely explanation for the ERROR_NOT_SUPPORTED (0x32)
+# a live windows run hit every time, on a host confirmed to have the
+# right service and audit-policy state already. but FwpmEngineOpen0's
+# return-value table doesn't list 0x32 specifically, so this is a
+# well-supported inference, not a confirmed mapping. re-confirm against
+# a live run before closing the investigation.
 _RPC_C_AUTHN_WINNT = 10
 
 
