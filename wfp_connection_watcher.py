@@ -8,6 +8,12 @@ from native_paths import build_device_path_map, filetime_to_epoch_seconds, to_do
 
 _MAX_TRACKED_EVENTS = 10000
 
+# how long start() waits for the dedicated thread to report success or
+# failure before giving up and degrading.
+# a module-level constant, not inline in start(), so tests can shrink it
+# instead of waiting out a real multi-second timeout.
+_START_WAIT_TIMEOUT = 10
+
 # confirmed against learn.microsoft.com's rpc authentication-service
 # constants page, fetched 2026-10-19: RPC_C_AUTHN_WINNT = 10.
 # the value used here before (1) is actually RPC_C_AUTHN_DCE_PRIVATE, a
@@ -193,6 +199,7 @@ class WfpConnectionWatcher:
         self._started_event = threading.Event()
         self._native_start_result = False
         self._native_start_error = None
+        self._summary_emitted = False
 
     def start(self):
         """
@@ -232,7 +239,23 @@ class WfpConnectionWatcher:
         self._started_event.clear()
         self._thread = threading.Thread(target=self._run_native_session, daemon=True, name="WfpConnectionWatcher")
         self._thread.start()
-        self._started_event.wait(timeout=10)
+        started_in_time = self._started_event.wait(timeout=_START_WAIT_TIMEOUT)
+
+        if not started_in_time:
+            # _native_start() itself is still blocked past the wait timeout, a hung
+            # native call.
+            # sets _stop_event now, before returning, since _run_native_session
+            # checks it right after _native_start() finally returns. this stops the
+            # thread from ever entering its pump loop unsupervised.
+            # without this, a native call that eventually does succeed would leave
+            # the engine subscribed and the audit policy already reverted, running
+            # forever with nothing left to signal it to stop.
+            self._stop_event.set()
+            self._revert_audit_policy_if_changed()
+            self.emit("ghostrun_status", "wfp_watcher_degraded", {
+                "reason": f"WFP engine open or event subscription timed out after {_START_WAIT_TIMEOUT}s",
+            })
+            return
 
         if not self._native_start_result:
             self._revert_audit_policy_if_changed()
@@ -273,6 +296,15 @@ class WfpConnectionWatcher:
         except ImportError:
             # pythoncom (part of pywin32) isn't installed on this platform, e.g.
             # this non-windows dev/test host. nothing to initialize.
+            pythoncom = None
+        except Exception:
+            # CoInitialize() itself can fail, e.g. a pywintypes.com_error, not just
+            # module missing.
+            # this hypothesis is explicitly optional (see this method's docstring),
+            # so a com failure is treated the same as pythoncom being unavailable
+            # instead of propagating. it must never block the actual wfp
+            # subscription attempt below, which doesn't need pythoncom at all if com
+            # genuinely isn't required here.
             pythoncom = None
 
         try:
@@ -336,12 +368,20 @@ class WfpConnectionWatcher:
         # all, or fired and every app-path resolution just failed.
         # this number answers that directly on the next run, instead of another
         # guess-and-check round.
-        if self._native_start_result:
+        #
+        # _summary_emitted guards against a second call double-reporting.
+        # the old check (self._engine_handle is not none) reset itself to none
+        # every time, so a second stop() just saw none and skipped.
+        # self._native_start_result never resets on its own, and ghostrun.py's
+        # on_exit()/_stop_native_watchers() is documented to call stop() again
+        # on every exit path even when normal teardown already called it once.
+        if self._native_start_result and not self._summary_emitted:
             with self._events_lock:
                 event_count = len(self._events)
             self.emit("ghostrun_status", "wfp_watcher_summary", {
                 "events_recorded": event_count,
             })
+            self._summary_emitted = True
 
         self._revert_audit_policy_if_changed()
 
