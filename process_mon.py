@@ -525,6 +525,22 @@ _TDH_INTYPE_SID = 19
 _SID_FIXED_HEADER_SIZE = 8
 _SID_MAX_SUB_AUTHORITIES = 15
 
+# EVENT_PROPERTY_INFO.Flags bits relevant to string decoding
+# confirmed against learn.microsoft.com/.../ne-tdh-property_flags, fetched
+# 2026-10-19: for a UnicodeString/AnsiString property, PropertyParamFixedLength
+# set means `length` holds the manifest-declared fixed byte size of this field
+# (e.g. <data length="12" .../>), not a null-terminated string
+# a live windows run hit exactly this on processstop's ImageName, which this
+# codebase previously always null-scanned regardless of this flag, silently
+# truncating or corrupting later properties' offsets whenever the fixed-length
+# field's content happened to contain no nul within its declared bounds
+# PropertyParamLength (dynamic length via lengthPropertyIndex from an earlier
+# property) is a separate case this module doesn't support, raised explicitly
+# as unsupported rather than guessed, since nothing in ProcessStart/
+# ProcessStopArgs (verified this session and the prior one) uses it
+_PROPERTY_PARAM_LENGTH = 0x2
+_PROPERTY_PARAM_FIXED_LENGTH = 0x10
+
 # fixed wire widths (bytes) for the scalar in-types this module decodes
 # not derived from EVENT_PROPERTY_INFO.length (only guaranteed nonzero
 # for some fixed-size properties, zero for variable-sized types like strings)
@@ -627,10 +643,14 @@ def _tdh_decode_event_properties(event_record_ptr):
     standard wire encoding: uint32/uint64 are fixed-width little-endian
     integers, filetime is a little-endian 100ns-tick integer (what
     filetime_to_epoch_seconds expects), unicode/AnsiString is a
-    null-terminated string, sid is a self-sizing 8 + 4*n byte structure
-    kept as raw bytes. that's the same approach every etw/tdh consumer
-    takes for primitive types, TdhFormatProperty exists mainly for types
-    this module never needs (maps, arrays, structs, ipv6, ...).
+    null-terminated string, unless EVENT_PROPERTY_INFO.Flags marks it
+    PropertyParamFixedLength, in which case it's exactly `length` bytes
+    (nul-padded, not necessarily nul-terminated) per the manifest's own
+    declared size, see _PROPERTY_PARAM_FIXED_LENGTH's module-level
+    comment. sid is a self-sizing 8 + 4*n byte structure kept as raw
+    bytes. that's the same approach every etw/tdh consumer takes for
+    primitive types, TdhFormatProperty exists mainly for types this
+    module never needs (maps, arrays, structs, ipv6, ...).
 
     an in-type outside this small supported set makes decoding the rest
     of the event's properties unsafe (their byte offsets can't be
@@ -659,11 +679,32 @@ def _tdh_decode_event_properties(event_record_ptr):
             is_wide = in_type == _TDH_INTYPE_UNICODESTRING
             step = 2 if is_wide else 1
             terminator = b"\x00\x00" if is_wide else b"\x00"
-            end = pos
-            while end + step <= len(data) and data[end:end + step] != terminator:
-                end += step
-            value = data[pos:end].decode("utf-16-le" if is_wide else "ascii", errors="replace")
-            pos = min(end + step, len(data))
+            if prop.Flags & _PROPERTY_PARAM_LENGTH:
+                raise OSError(
+                    f"unsupported dynamic-length string property '{name}' (PropertyParamLength)"
+                )
+            if prop.Flags & _PROPERTY_PARAM_FIXED_LENGTH:
+                length = prop.length
+                if pos + length > len(data):
+                    raise OSError(f"ETW UserData truncated decoding fixed-length property '{name}'")
+                raw = data[pos:pos + length]
+                if is_wide:
+                    # strip trailing nul padding in whole 2-byte utf-16le code units, not raw
+                    # bytes: a plain rstrip(b"\x00") would eat into the final real character's
+                    # own high byte whenever it happens to be 0x00 (e.g. 'e' == 0x65 0x00),
+                    # corrupting it instead of trimming padding
+                    while len(raw) >= step and raw[-step:] == terminator:
+                        raw = raw[:-step]
+                else:
+                    raw = raw.rstrip(terminator)
+                value = raw.decode("utf-16-le" if is_wide else "ascii", errors="replace")
+                pos += length
+            else:
+                end = pos
+                while end + step <= len(data) and data[end:end + step] != terminator:
+                    end += step
+                value = data[pos:end].decode("utf-16-le" if is_wide else "ascii", errors="replace")
+                pos = min(end + step, len(data))
         elif in_type in _TDH_FIXED_WIDTHS:
             width = _TDH_FIXED_WIDTHS[in_type]
             if pos + width > len(data):
