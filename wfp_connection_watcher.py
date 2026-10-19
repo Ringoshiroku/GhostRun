@@ -234,6 +234,21 @@ class WfpConnectionWatcher:
             return
 
     def stop(self):
+        # reported only when this watcher actually started a session
+        # (self._engine_handle is set).
+        # a live run where _native_start succeeds (no wfp_watcher_degraded) but
+        # every network event still comes back unresolved gives no way to tell,
+        # from the evidence alone, whether the native callback never fired at
+        # all, or fired and every app-path resolution just failed.
+        # this number answers that directly on the next run, instead of another
+        # guess-and-check round.
+        if self._engine_handle is not None:
+            with self._events_lock:
+                event_count = len(self._events)
+            self.emit("ghostrun_status", "wfp_watcher_summary", {
+                "events_recorded": event_count,
+            })
+
         # best-effort teardown.
         # a failing or raising _native_stop() (e.g. today's NotImplementedError
         # stub) must not stop the audit-policy restore below from running.
