@@ -198,13 +198,23 @@ class WfpConnectionWatcher:
 
         try:
             native_started = self._native_start()
-        except Exception:
+            native_start_error = None
+        except Exception as exc:
             native_started = False
+            native_start_error = str(exc)
 
         if not native_started:
             self._revert_audit_policy_if_changed()
+            reason = "WFP engine open or event subscription failed"
+            if native_start_error:
+                # native_start_error names which call failed and with what status
+                # code, see _native_start.
+                # a live run that only surfaced the generic reason above, with no way
+                # to tell FwpmEngineOpen0 apart from FwpmNetEventSubscribe4 or see the
+                # actual status, left nothing to actually diagnose.
+                reason = f"{reason}: {native_start_error}"
             self.emit("ghostrun_status", "wfp_watcher_degraded", {
-                "reason": "WFP engine open or event subscription failed",
+                "reason": reason,
             })
             return
 
@@ -311,10 +321,12 @@ class WfpConnectionWatcher:
         """
         opens the wfp engine handle and subscribes to CLASSIFY_ALLOW net
         events, decoding each into a call to self._on_event().
-        returns true on success, false on any failure, never raises.
-        start() already wraps this call in try/except as defense in
-        depth, but this method also returns false itself on a documented
-        failure rather than relying only on that wrapper.
+        returns true on success. raises oserror naming the failed call
+        and its status code on a documented native failure
+        (FwpmEngineOpen0 or FwpmNetEventSubscribe4 returning non-zero),
+        so start()'s emitted wfp_watcher_degraded reason is actionable
+        instead of generic. start() still wraps this call in try/except
+        as defense in depth either way.
 
         struct/enum layout verified against learn.microsoft.com's
         fwpmtypes/fwpmu pages, see the module-level comment above
@@ -336,7 +348,15 @@ class WfpConnectionWatcher:
         engine_handle = wintypes.HANDLE()
         status = fwpuclnt.FwpmEngineOpen0(None, 1, None, None, ctypes.byref(engine_handle))  # RPC_C_AUTHN_WINNT = 1
         if status != 0:
-            return False
+            # raises instead of returning false, matching
+            # _wfp_unsubscribe_and_close's pattern, so start()'s emitted
+            # wfp_watcher_degraded reason names which native call failed and with
+            # what status code, instead of a generic message. this is the exact gap
+            # a live windows run hit.
+            # status 0x80320001-0x80320039 is an FWP_E_* code, 0x80010001-0x80010122
+            # is an RPC_* code, see fwpmengineopen0's return-value table on
+            # learn.microsoft.com.
+            raise OSError(f"FwpmEngineOpen0 failed: status=0x{status:08x}")
 
         self._device_path_map = build_device_path_map()
 
@@ -354,7 +374,7 @@ class WfpConnectionWatcher:
         )
         if status != 0:
             fwpuclnt.FwpmEngineClose0(engine_handle)
-            return False
+            raise OSError(f"FwpmNetEventSubscribe4 failed: status=0x{status:08x}")
 
         self._engine_handle = engine_handle
         self._subscription_handle = events_handle
