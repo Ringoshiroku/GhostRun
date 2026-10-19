@@ -344,6 +344,17 @@ class WfpConnectionWatcher:
         other optional native capability here avoids breaking.
         """
         fwpuclnt = ctypes.WinDLL("Fwpuclnt")
+        # every FwpmXxx0 function returns a dword, per learn.microsoft.com's
+        # signature blocks cited throughout this file.
+        # ctypes defaults an unconfigured function's return to signed c_int, and
+        # every realistic failure status (FWP_E_* and RPC_*) is >= 0x80000000,
+        # so it comes back negative under that default. that silently broke the
+        # hex status this method's error messages need to show.
+        # confirmed live: the unfixed code rendered a real FWP_E_* code as
+        # "status=0x-7fcdffff", not a hex value an analyst could look up.
+        fwpuclnt.FwpmEngineOpen0.restype = wintypes.DWORD
+        fwpuclnt.FwpmNetEventSubscribe4.restype = wintypes.DWORD
+        fwpuclnt.FwpmEngineClose0.restype = wintypes.DWORD
 
         engine_handle = wintypes.HANDLE()
         status = fwpuclnt.FwpmEngineOpen0(None, 1, None, None, ctypes.byref(engine_handle))  # RPC_C_AUTHN_WINNT = 1
@@ -406,9 +417,15 @@ def _wfp_unsubscribe_and_close(engine_handle, subscription_handle):
     live-windows test test_wfp_unsubscribe_and_close_succeeds_on_live_windows.
     """
     fwpuclnt = ctypes.WinDLL("Fwpuclnt")
+    # same restype fix as _native_start, same reason: both are documented
+    # dword-returning functions, and ctypes' unconfigured default (signed
+    # c_int) would sign-extend any realistic failure status into a negative
+    # int.
+    fwpuclnt.FwpmNetEventUnsubscribe0.restype = wintypes.DWORD
+    fwpuclnt.FwpmEngineClose0.restype = wintypes.DWORD
     status = fwpuclnt.FwpmNetEventUnsubscribe0(engine_handle, subscription_handle)
     if status != 0:
-        raise OSError(f"FwpmNetEventUnsubscribe0 failed: {status}")
+        raise OSError(f"FwpmNetEventUnsubscribe0 failed: status=0x{status:08x}")
     status = fwpuclnt.FwpmEngineClose0(engine_handle)
     if status != 0:
-        raise OSError(f"FwpmEngineClose0 failed: {status}")
+        raise OSError(f"FwpmEngineClose0 failed: status=0x{status:08x}")
