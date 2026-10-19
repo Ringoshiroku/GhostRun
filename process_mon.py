@@ -871,7 +871,20 @@ class ProcessMonitor:
             self._trigger_mutex_scan()
 
     def _handle_etw_process_stop(self, pid, name):
-        self.image_paths.pop(pid, None)
+        # ProcessStop's own ImageName is confirmed, via two separate live windows
+        # runs, to come back from the kernel genuinely truncated to a short fixed
+        # length (e.g. "ghostrun_test_" for "ghostrun_test_harness.exe"), with
+        # nothing after it in the raw UserData buffer at all
+        # not a manifest-declared fixed-length property, that case is handled
+        # correctly elsewhere in _tdh_decode_event_properties, confirmed because
+        # fixing that case didn't change this symptom between the two runs
+        # whatever the real reason this field is short on exit telemetry, the fix
+        # doesn't need to know why: this pid's own ProcessStart event already
+        # recorded its full, untruncated image path, so prefer that over
+        # ProcessStop's own unreliable value whenever we have it
+        tracked_path = self.image_paths.pop(pid, None)
+        if tracked_path:
+            name = os.path.basename(tracked_path)
         if self.is_descendant(pid, self.root_pid):
             self.emit("process", "process_terminate", {"pid": pid, "name": name})
             self._trigger_mutex_scan()
