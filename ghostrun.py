@@ -23,7 +23,7 @@ from mutex_watch import MutexMonitor, list_all_named_objects
 from timeline_builder import TimelineBuilder
 from network_finding_engine import NetworkFindingEngine
 from process_termination import kill_process_tree
-from wfp_connection_watcher import WfpConnectionWatcher
+from etw_connection_watcher import EtwConnectionWatcher
 import atexit
 import signal
 
@@ -37,7 +37,7 @@ network_infer = None
 EVIDENCE_QUEUE = queue.Queue()
 ALL_EVIDENCE = []
 network_finding = None
-wfp_watcher = None
+net_watcher = None
 proc_monitor = None
 
 MALWARE_IDENTITY = {
@@ -109,25 +109,25 @@ def emit(category, event, data, **meta):
 
 
 def on_exit():
-    # stop the wfp watcher on every abnormal exit (an uncaught exception,
+    # stop net_watcher on every abnormal exit (an uncaught exception,
     # SIGINT, or SIGTERM), not just the normal post-timeout teardown path
     # below
-    # once _native_start/_native_stop are real, a run that never reaches that
-    # teardown would otherwise leave the host's "filtering platform
-    # connection" audit subcategory permanently enabled
+    # a run that never reaches that teardown would otherwise leave its
+    # fixed-name etw session ("GhostRunNetworkMonitor") running until explicit
+    # stop or reboot, blocking that same session name on every later run
     # idempotent and safe to call again even if normal teardown already
-    # called it (set_filtering_platform_connection_audit only runs when this
-    # instance is the one that changed it in the first place)
-    # proc_monitor is stopped on the same paths, for the same reason: its
-    # fixed-name etw session would otherwise outlive this process (see
+    # stopped it (EtwSession.stop() is a no-op when never started or already
+    # stopped)
+    # proc_monitor is stopped on the same paths, for the same reason: its own
+    # fixed-name etw session would otherwise outlive this process too (see
     # _stop_native_watchers)
     #
     # safety first: when a sample was actually launched, killing its process
-    # tree takes priority over reverting the audit policy
-    # wfp_watcher.stop()'s revert call can itself take several seconds (its
-    # own subprocess has a timeout), and the sample must not keep running
-    # during that wait on an abnormal exit (ctrl+c, crash)
-    # wfp_watcher.stop() still always runs, via finally, even if the kill
+    # tree takes priority over stopping net_watcher
+    # net_watcher.stop() waits (join(timeout=10)) for its event-pump thread to
+    # unblock and exit, and the sample must not keep running during that wait
+    # on an abnormal exit (ctrl+c, crash)
+    # net_watcher.stop() still always runs, via finally, even if the kill
     # raises, so exactly one stop() call happens on every path through this
     # function
     pid = MALWARE_IDENTITY.get("pid")
@@ -175,9 +175,9 @@ def on_exit():
 def _stop_native_watchers():
     """
     stops the two watchers that hold os-level state outliving this process:
-    proc_monitor's etw session (fixed session name; an etw session stays
-    alive until explicitly stopped or reboot, so leaking it breaks every
-    later run's StartTraceW) and wfp_watcher's audit-policy change.
+    proc_monitor's and net_watcher's fixed-name etw sessions (an etw session
+    stays alive until explicitly stopped or reboot, so leaking either
+    breaks every later run's StartTraceW for that session name).
     each is attempted independently, so one failing never skips the other.
     both stop() methods are idempotent, so calling this after normal
     teardown already stopped them is harmless.
@@ -187,9 +187,9 @@ def _stop_native_watchers():
             proc_monitor.stop()
         except Exception:
             pass
-    if wfp_watcher is not None:
+    if net_watcher is not None:
         try:
-            wfp_watcher.stop()
+            net_watcher.stop()
         except Exception:
             pass
 
@@ -256,7 +256,7 @@ def main():
 
     print("[GhostRun] Starting controller")
 
-    global persistence, network_infer, network_finding, wfp_watcher, proc_monitor
+    global persistence, network_infer, network_finding, net_watcher, proc_monitor
 
     FS_TARGETS = {
         "TEMP": os.environ.get("TEMP"),
@@ -352,7 +352,7 @@ def main():
     # and network_finding are all built with root_pid=None and patched in
     # live once the sample's PID is known, same as FilesystemWatcher above
     # mutex_monitor and proc_monitor are built here, not down in section 4
-    # where their threads actually start, because WfpConnectionWatcher needs
+    # where their threads actually start, because EtwConnectionWatcher needs
     # a built proc_monitor to resolve ports to pids
     # and proc_monitor's own run() calls mutex_monitor.trigger_scan() as soon
     # as its thread starts, so mutex_monitor must already exist by then too
@@ -382,14 +382,14 @@ def main():
         process_monitor=proc_monitor
     )
 
-    wfp_watcher = WfpConnectionWatcher(process_monitor=proc_monitor, emit_func=emit)
-    wfp_watcher.start()
+    net_watcher = EtwConnectionWatcher(process_monitor=proc_monitor, emit_func=emit)
+    net_watcher.start()
 
-    # registered here, right after wfp_watcher is up, rather than after the
+    # registered here, right after net_watcher is up, rather than after the
     # Popen try/except below
     # if Popen itself fails (e.g. a bad -s path) and sys.exit(1) fires,
-    # on_exit() must already be registered so it still runs and reverts the
-    # audit-policy change wfp_watcher.start() may have just made
+    # on_exit() must already be registered so it still runs and stops the
+    # etw session net_watcher.start() may have just started
     # on_exit() has an early-return path for pid not being set yet, so
     # registering this early is safe even though ROOTPID doesn't exist until
     # after Popen succeeds
@@ -404,7 +404,7 @@ def main():
         sslkeylogfile_path=sslkeylogfile_path,
         exclude_host=args.host,
         exclude_port=args.port,
-        connection_monitor=wfp_watcher,
+        connection_monitor=net_watcher,
     )
     net_capture.start()
 
@@ -573,8 +573,8 @@ def main():
     # the try/except is only defense in depth for teardown itself
     # (trigger_scan() just sets a flag and an event)
     # nothing here may skip the rest of teardown below (stop(),
-    # wfp_watcher.stop()'s audit-policy revert, the thread joins, and the
-    # pcap/suricata analysis)
+    # net_watcher.stop()'s own etw session shutdown, the thread joins, and
+    # the pcap/suricata analysis)
     try:
         mutex_monitor.trigger_scan()
     except Exception as exc:
@@ -582,7 +582,7 @@ def main():
             "error": str(exc),
         })
     mutex_monitor.stop()
-    wfp_watcher.stop()
+    net_watcher.stop()
 
     proc_thread.join(timeout=5)
     persistence_thread.join(timeout=5)
