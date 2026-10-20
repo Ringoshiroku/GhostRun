@@ -353,7 +353,9 @@ def main():
     # live once the sample's PID is known, same as FilesystemWatcher above
     # mutex_monitor and proc_monitor are built here, not down in section 4
     # where their threads actually start, because EtwConnectionWatcher needs
-    # a built proc_monitor to resolve ports to pids
+    # a built proc_monitor to filter etw events down to the malware's own
+    # process tree via is_descendant (each event already carries its own pid,
+    # so proc_monitor isn't resolving ports to pids here)
     # and proc_monitor's own run() calls mutex_monitor.trigger_scan() as soon
     # as its thread starts, so mutex_monitor must already exist by then too
     # os.path.dirname(args.file) is "" when --file is a bare filename with no
