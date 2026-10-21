@@ -22,12 +22,15 @@ import etw_session
 #   processes. see this task's design doc for details.
 # - connection-attempted (TCP, event ID 12) and the UDP data-sent event
 #   (ID 42): both confirmed live on FlareVM under real traffic with
-#   correct PID attribution. UDP has no handshake, so the first ID 42
-#   for a flow stands in for WFP's CLASSIFY_ALLOW event.
-# - PID property name ("PID"): not independently verified against a
-#   decoded event on this dev host. backed by real evidence though:
-#   Velociraptor's published artifact for this exact provider GUID
-#   reads the process from EventData.PID. deliberately not using
+#   correct PID attribution. UDP has no handshake, so event ID 42
+#   fires for every datagram, not just the first one per flow (there's
+#   no per-flow state here to tell "first" from "nth"), making it the
+#   UDP analog of WFP's CLASSIFY_ALLOW event.
+# - PID property name ("PID"): confirmed against a real decoded event
+#   on FlareVM (run8.jsonl stored PID 2452, matching process_mon.py's
+#   own independently-tracked process tree exactly). also backed by
+#   Velociraptor's published artifact for this exact provider GUID,
+#   which reads the process from EventData.PID. deliberately not using
 #   EVENT_HEADER.ProcessId, since Microsoft's own docs warn some
 #   network events get logged by a separate thread, making that PID
 #   unreliable.
@@ -61,6 +64,13 @@ _KERNEL_NETWORK_PROVIDER_GUID = etw_session.GUID(
 _TCP_CONNECTION_ATTEMPTED_EVENT_ID = 12
 _UDP_DATA_SENT_EVENT_ID = 42
 _CONNECTION_EVENT_IDS = (_TCP_CONNECTION_ATTEMPTED_EVENT_ID, _UDP_DATA_SENT_EVENT_ID)
+
+# IPv4 only. Kernel-Network splits events by address family, and these
+# two IDs are the IPv4 ones. an IPv6 connection's event ID and address
+# layout were never confirmed live, so they're not guessed at here,
+# see this task's design doc's "known limitations" section. an IPv6
+# connection falls back to the existing capture-derived/root-PID
+# attribution instead, not a crash or a wrong PID.
 
 # confirmed, see module comment above: Velociraptor's published artifact
 # for this exact provider GUID reads the process from EventData.PID.
@@ -128,7 +138,7 @@ class EtwConnectionWatcher:
         self.process_monitor = process_monitor
         self.emit = emit_func
         self._events_lock = threading.Lock()
-        self._events = collections.deque(maxlen=_MAX_TRACKED_EVENTS)  # [(timestamp, local_port, pid, remote_port)]
+        self._events = collections.OrderedDict()  # {(local_port, pid): (timestamp, remote_port)}, LRU-bounded, see _on_event_record.
         self._callback_failure_notified = False
         self._thread = None
         # diagnostic-only counters, not used by resolve_pid.
@@ -137,13 +147,14 @@ class EtwConnectionWatcher:
         # filter discarded them all. connection_monitor_summary (see stop())
         # reports both counts so that distinction doesn't need ad hoc
         # instrumentation every time it comes up.
+        self._summary_emitted = False  # stop() is called twice in the normal exit path, see its own docstring.
         self._events_received = 0
         self._events_stored = 0
         self._session = etw_session.EtwSession(
             session_name="GhostRunNetworkMonitor",
             provider_guid=_KERNEL_NETWORK_PROVIDER_GUID,
             keyword_mask=_KERNEL_NETWORK_KEYWORD_MASK,
-            trace_level=etw_session._TRACE_LEVEL_INFORMATION,
+            trace_level=etw_session.TRACE_LEVEL_INFORMATION,
             event_record_callback=self._etw_event_record_callback,
         )
 
@@ -153,15 +164,15 @@ class EtwConnectionWatcher:
         closest in time to approx_timestamp, or None if that port was
         never recorded.
 
-        same contract as WfpConnectionWatcher.resolve_pid
-        (wfp_connection_watcher.py:465), carried over unchanged: pure
-        and provider-agnostic.
+        same contract as the former WfpConnectionWatcher.resolve_pid
+        (removed in a82e73c), carried over unchanged: pure and
+        provider-agnostic.
         """
         best_pid, best_delta = None, None
         with self._events_lock:
-            events = list(self._events)
-        for ts, port, pid, _remote_port in events:
-            if port == local_port and pid is not None:
+            items = list(self._events.items())
+        for (port, pid), (ts, _remote_port) in items:
+            if port == local_port:
                 delta = abs(ts - approx_timestamp)
                 if best_delta is None or delta < best_delta:
                     best_delta, best_pid = delta, pid
@@ -199,7 +210,20 @@ class EtwConnectionWatcher:
             remote_port = _ntohs(remote_port)
         timestamp = time.time()
         with self._events_lock:
-            self._events.append((timestamp, local_port, pid, remote_port))
+            # keyed by (local_port, pid), not appended as a plain list.
+            # a long-lived socket sending many datagrams on the same local
+            # port (a persistent UDP beacon, DNS tunneling) would otherwise
+            # fill the bounded store with near-duplicate entries, evicting
+            # older, genuinely different connections under
+            # _MAX_TRACKED_EVENTS.
+            # re-storing the same key just refreshes its timestamp and moves
+            # it to the back (most-recently-used), so it's evicted last, not
+            # first, next time it's touched.
+            key = (local_port, pid)
+            self._events[key] = (timestamp, remote_port)
+            self._events.move_to_end(key)
+            if len(self._events) > _MAX_TRACKED_EVENTS:
+                self._events.popitem(last=False)
             self._events_stored += 1
 
     def _etw_event_record_callback(self, event_record_ptr):
@@ -233,7 +257,7 @@ class EtwConnectionWatcher:
                 self._callback_failure_notified = True
                 try:
                     self.emit("ghostrun_status", "connection_monitor_degraded", {
-                        "reason": f"ETW event handling failed: {type(exc).__name__}: {exc}",
+                        "error": f"ETW event handling failed: {type(exc).__name__}: {exc}",
                     })
                 except Exception:
                     pass
@@ -293,23 +317,29 @@ class EtwConnectionWatcher:
         it" run, since the two otherwise look the same from
         resolve_pid's output alone. only emitted when start() actually
         ran (self._thread is not None); a watcher that never started
-        has nothing to report.
+        has nothing to report. emitted at most once, guarded by
+        _summary_emitted, since ghostrun.py calls stop() both directly
+        and again from its atexit handler, and a second emission would
+        just duplicate the first.
 
         stored_ports lists every (local_port, pid, remote_port)
         actually stored, not just the counts. events_stored>0 with
         resolve_pid still matching nothing means the stored ports
         don't line up with whatever the caller is resolving against, a
-        mismatch the counts alone can't show. remote_port in
-        particular can reveal a stored connection that was never
-        really malware traffic, e.g. GhostRun's own loopback evidence
-        channel.
+        mismatch the counts alone can't show. confirmed useful this
+        way live: it's what actually found the sport/dport byte-order
+        bug, not the GhostRun-loopback-evidence-channel theory it was
+        first written to test, which turned out wrong.
         """
         self._session.stop()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=10)
-        if self._thread is not None:
+        if self._thread is not None and not self._summary_emitted:
+            self._summary_emitted = True
             with self._events_lock:
-                stored_ports = [[port, pid, remote_port] for _ts, port, pid, remote_port in self._events]
+                stored_ports = [
+                    [port, pid, remote_port] for (port, pid), (_ts, remote_port) in self._events.items()
+                ]
             self.emit("ghostrun_status", "connection_monitor_summary", {
                 "events_received": self._events_received,
                 "events_stored": self._events_stored,
