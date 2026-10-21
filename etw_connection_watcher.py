@@ -103,7 +103,7 @@ class EtwConnectionWatcher:
         self.process_monitor = process_monitor
         self.emit = emit_func
         self._events_lock = threading.Lock()
-        self._events = collections.deque(maxlen=_MAX_TRACKED_EVENTS)  # [(timestamp, local_port, pid)]
+        self._events = collections.deque(maxlen=_MAX_TRACKED_EVENTS)  # [(timestamp, local_port, pid, remote_port)]
         self._callback_failure_notified = False
         self._thread = None
         # diagnostic-only counters, not used by resolve_pid.
@@ -135,7 +135,7 @@ class EtwConnectionWatcher:
         best_pid, best_delta = None, None
         with self._events_lock:
             events = list(self._events)
-        for ts, port, pid in events:
+        for ts, port, pid, _remote_port in events:
             if port == local_port and pid is not None:
                 delta = abs(ts - approx_timestamp)
                 if best_delta is None or delta < best_delta:
@@ -152,14 +152,25 @@ class EtwConnectionWatcher:
         timestamp is negligible, and resolve_pid only needs
         nearest-in-time anyway, so there's no need to decode a payload
         timestamp field whose name was never confirmed.
+
+        remote_port is stored alongside but resolve_pid doesn't use
+        it. it exists so connection_monitor_summary (see stop()) can
+        show what a stored connection actually went to, e.g. to
+        diagnose GhostRun's own loopback evidence-channel traffic
+        (excluded by --host/--port on NetworkCapture) getting captured
+        here by mistake. read with .get(), not direct indexing: unlike
+        local_port, it isn't load-bearing for resolve_pid, so a props
+        dict that omits it (e.g. a test exercising only the
+        malware-tree filter) shouldn't raise.
         """
         pid = props[_PROPERTY_PID]
         if not self.process_monitor.is_descendant(pid, self.process_monitor.root_pid):
             return
         local_port = props[_PROPERTY_LOCAL_PORT]
+        remote_port = props.get(_PROPERTY_REMOTE_PORT)
         timestamp = time.time()
         with self._events_lock:
-            self._events.append((timestamp, local_port, pid))
+            self._events.append((timestamp, local_port, pid, remote_port))
             self._events_stored += 1
 
     def _etw_event_record_callback(self, event_record_ptr):
@@ -255,18 +266,21 @@ class EtwConnectionWatcher:
         ran (self._thread is not None); a watcher that never started
         has nothing to report.
 
-        stored_ports lists every (local_port, pid) actually stored,
-        not just the counts. events_stored>0 with resolve_pid still
-        matching nothing means the stored ports don't line up with
-        whatever the caller is resolving against, a mismatch the
-        counts alone can't show.
+        stored_ports lists every (local_port, pid, remote_port)
+        actually stored, not just the counts. events_stored>0 with
+        resolve_pid still matching nothing means the stored ports
+        don't line up with whatever the caller is resolving against, a
+        mismatch the counts alone can't show. remote_port in
+        particular can reveal a stored connection that was never
+        really malware traffic, e.g. GhostRun's own loopback evidence
+        channel.
         """
         self._session.stop()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=10)
         if self._thread is not None:
             with self._events_lock:
-                stored_ports = [[port, pid] for _ts, port, pid in self._events]
+                stored_ports = [[port, pid, remote_port] for _ts, port, pid, remote_port in self._events]
             self.emit("ghostrun_status", "connection_monitor_summary", {
                 "events_received": self._events_received,
                 "events_stored": self._events_stored,
