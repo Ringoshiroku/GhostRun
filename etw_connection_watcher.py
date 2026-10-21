@@ -106,6 +106,14 @@ class EtwConnectionWatcher:
         self._events = collections.deque(maxlen=_MAX_TRACKED_EVENTS)  # [(timestamp, local_port, pid)]
         self._callback_failure_notified = False
         self._thread = None
+        # diagnostic-only counters, not used by resolve_pid.
+        # a run where resolve_pid matches nothing looks the same either way:
+        # zero events delivered, or plenty delivered and the malware-tree
+        # filter discarded them all. connection_monitor_summary (see stop())
+        # reports both counts so that distinction doesn't need ad hoc
+        # instrumentation every time it comes up.
+        self._events_received = 0
+        self._events_stored = 0
         self._session = etw_session.EtwSession(
             session_name="GhostRunNetworkMonitor",
             provider_guid=_KERNEL_NETWORK_PROVIDER_GUID,
@@ -152,6 +160,7 @@ class EtwConnectionWatcher:
         timestamp = time.time()
         with self._events_lock:
             self._events.append((timestamp, local_port, pid))
+            self._events_stored += 1
 
     def _etw_event_record_callback(self, event_record_ptr):
         """
@@ -174,6 +183,7 @@ class EtwConnectionWatcher:
         event_id = event_record.EventHeader.EventDescriptor.Id
         if event_id not in _CONNECTION_EVENT_IDS:
             return
+        self._events_received += 1
 
         try:
             props = etw_session.decode_event_properties(event_record_ptr)
@@ -234,7 +244,22 @@ class EtwConnectionWatcher:
         idempotent: EtwSession.stop() is already a no-op when never
         started or already stopped, and a None/dead self._thread
         (start() never called or never succeeded) is simply skipped.
+
+        emits a connection_monitor_summary status with the raw
+        received/stored counts after the thread has joined, so nothing
+        is still writing to them. this is the clearest way to tell a
+        "provider delivered nothing" run apart from a "provider
+        delivered plenty but the malware-tree filter discarded all of
+        it" run, since the two otherwise look the same from
+        resolve_pid's output alone. only emitted when start() actually
+        ran (self._thread is not None); a watcher that never started
+        has nothing to report.
         """
         self._session.stop()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=10)
+        if self._thread is not None:
+            self.emit("ghostrun_status", "connection_monitor_summary", {
+                "events_received": self._events_received,
+                "events_stored": self._events_stored,
+            })
