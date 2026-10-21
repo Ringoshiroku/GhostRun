@@ -33,9 +33,13 @@ import etw_session
 #   unreliable.
 # - local/remote address and port property names
 #   (_PROPERTY_LOCAL_PORT, _PROPERTY_REMOTE_PORT,
-#   _PROPERTY_LOCAL_ADDRESS, _PROPERTY_REMOTE_ADDRESS): unconfirmed.
-#   best-guess placeholders, not cited facts. isolated as named
-#   constants below so a later live fix doesn't touch any decode logic.
+#   _PROPERTY_LOCAL_ADDRESS, _PROPERTY_REMOTE_ADDRESS): confirmed live
+#   on FlareVM as "sport"/"dport"/"saddr"/"daddr". a real "Connection
+#   attempted" event's own TDH decode error named the "dport" property
+#   directly, see etw_session.py's _TDH_INTYPE_UINT16 citation. a
+#   public capture of this same provider/event independently
+#   corroborates the full field layout, see wiki.tcl-lang.org/page/
+#   Event+Tracing+for+Windows.
 # - keyword mask: deliberately 0 (MatchAnyKeyword), not a guessed bit.
 #   the real per-event keyword wasn't confirmed this session, unlike
 #   Kernel-Process's confirmed keyword. EnableTraceEx2's own docs say
@@ -62,12 +66,11 @@ _CONNECTION_EVENT_IDS = (_TCP_CONNECTION_ATTEMPTED_EVENT_ID, _UDP_DATA_SENT_EVEN
 # for this exact provider GUID reads the process from EventData.PID.
 _PROPERTY_PID = "PID"
 
-# unconfirmed placeholders, see module comment above.
-# must be checked against a real decoded event on FlareVM before merge.
-_PROPERTY_LOCAL_PORT = "LocalPort"
-_PROPERTY_REMOTE_PORT = "RemotePort"
-_PROPERTY_LOCAL_ADDRESS = "LocalAddress"
-_PROPERTY_REMOTE_ADDRESS = "RemoteAddress"
+# confirmed, see module comment above.
+_PROPERTY_LOCAL_PORT = "sport"
+_PROPERTY_REMOTE_PORT = "dport"
+_PROPERTY_LOCAL_ADDRESS = "saddr"
+_PROPERTY_REMOTE_ADDRESS = "daddr"
 
 # MatchAnyKeyword=0 enables all keywords, see module comment above.
 _KERNEL_NETWORK_KEYWORD_MASK = 0

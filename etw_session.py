@@ -448,6 +448,7 @@ class _TRACE_EVENT_INFO(ctypes.Structure):
 # cite the same page and agree on every value.
 _TDH_INTYPE_UNICODESTRING = 1
 _TDH_INTYPE_ANSISTRING = 2
+_TDH_INTYPE_UINT16 = 6
 _TDH_INTYPE_UINT32 = 8
 _TDH_INTYPE_UINT64 = 10
 _TDH_INTYPE_FILETIME = 17
@@ -456,7 +457,15 @@ _TDH_INTYPE_FILETIME = 17
 # values. TDH_INTYPE_SID is its 20th member (null=0, unicodestring=1,
 # ansistring=2, int8..uint64=3..10, float=11, double=12, boolean=13,
 # binary=14, guid=15, pointer=16, filetime=17, systemtime=18, sid=19),
-# consistent with the values above.
+# consistent with the values above (uint16 is the 7th member, value 6:
+# int8=3, uint8=4, int16=5, uint16=6).
+#
+# uint16 was added from this task's live FlareVM verification: a real
+# kernel-network "connection attempted" event raised "unsupported tdh
+# in-type 6 decoding property 'dport'" the first time this module tried
+# to decode a port field. that confirmed both the in-type value and
+# that port fields use it (ports are 16-bit, this is the standard wire
+# type for them, not specific to this provider).
 _TDH_INTYPE_SID = 19
 
 # fixed part of a sid's wire form: ms-dtyp 2.4.2.2 "sid, packet
@@ -498,6 +507,7 @@ _PROPERTY_PARAM_FIXED_LENGTH = 0x10
 # convention every etw/tdh consumer (including elastic's go one)
 # relies on.
 _TDH_FIXED_WIDTHS = {
+    _TDH_INTYPE_UINT16: 2,
     _TDH_INTYPE_UINT32: 4,
     _TDH_INTYPE_UINT64: 8,
     _TDH_INTYPE_FILETIME: 8,
