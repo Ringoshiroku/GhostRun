@@ -1,4 +1,5 @@
 import ctypes
+import threading
 from ctypes import wintypes
 
 # etw native struct/constant declarations.
@@ -752,6 +753,21 @@ class EtwSession:
         self._props_buf = None
         self._trace_handle = None
         self._callback_ref = None  # keep the ctypes callback alive, see process_trace
+        # guards stop()'s check-then-act on _session_handle/_props_buf. a
+        # consumer that owns this session from a background thread (e.g.
+        # EtwConnectionWatcher) can call stop() from two places at once: the
+        # external caller, and that thread's own `finally: self._session.stop()`
+        # after process_trace() returns, which the external call's
+        # ControlTraceW is what unblocks in the first place.
+        #
+        # without this lock, both calls can read _session_handle as non-none
+        # before either clears it, and the second call then races the first's
+        # cleanup to build its own ControlTraceW arguments, which can observe a
+        # half-cleared state. confirmed live during this task's FlareVM
+        # verification: likely cause of one observed "exception in thread
+        # EtwConnectionWatcher" crash, reproduced locally as a
+        # ctypes.ArgumentError from a none handle argument.
+        self._stop_lock = threading.Lock()
 
     def start(self):
         """
@@ -834,11 +850,38 @@ class EtwSession:
         process_trace return, per its documented remarks). safe to call
         from a different thread than the one blocked in ProcessTrace,
         that's the whole point: stop() runs on whichever thread the
-        caller calls it from. idempotent: a call when _session_handle
-        is already none (never started, or already stopped) is a no-op.
+        caller calls it from, including two threads calling it at once
+        (see _stop_lock's own comment in __init__). idempotent: a call
+        when _session_handle is already none (never started, or already
+        stopped) is a no-op.
+
+        the check, the read of _session_handle/_props_buf, and the
+        clear all happen under the lock, so a second concurrent caller
+        either sees the none left behind by the first and returns right
+        away, or hasn't started yet and sees it once it gets the lock:
+        never a half-cleared state. the actual native call happens
+        outside the lock, against copied-out locals, since
+        ControlTraceW can block and holding the lock across it would
+        serialize an unrelated caller's no-op check behind a slow
+        native call for no reason.
+
+        swallows any exception the native call itself raises
+        (previously it didn't: a failure here propagated to the caller,
+        which is exactly how the pre-lock race surfaced as an uncaught
+        thread exception). stop() is already documented elsewhere in
+        this module as "safe to call" / "idempotent" cleanup, unlike
+        start()'s and process_trace()'s raise-on-failure contract:
+        nothing downstream needs stop() to fail loudly, and start()/
+        process_trace() already call stop() on their own failure
+        paths, where a second failure escaping would be worse than
+        losing the first one's detail.
         """
-        if self._session_handle is None:
-            return
+        with self._stop_lock:
+            session_handle, props_buf = self._session_handle, self._props_buf
+            if session_handle is None:
+                return
+            self._session_handle = None
+            self._props_buf = None
         try:
             advapi32 = ctypes.WinDLL("advapi32")
             advapi32.ControlTraceW.argtypes = [
@@ -846,12 +889,11 @@ class EtwSession:
             ]
             advapi32.ControlTraceW.restype = ctypes.c_ulong
             advapi32.ControlTraceW(
-                self._session_handle, None, ctypes.cast(self._props_buf, ctypes.c_void_p),
+                session_handle, None, ctypes.cast(props_buf, ctypes.c_void_p),
                 _EVENT_TRACE_CONTROL_STOP,
             )
-        finally:
-            self._session_handle = None
-            self._props_buf = None
+        except Exception:
+            pass
 
     def process_trace(self):
         """
