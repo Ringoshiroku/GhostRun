@@ -254,12 +254,21 @@ class EtwConnectionWatcher:
         resolve_pid's output alone. only emitted when start() actually
         ran (self._thread is not None); a watcher that never started
         has nothing to report.
+
+        stored_ports lists every (local_port, pid) actually stored,
+        not just the counts. events_stored>0 with resolve_pid still
+        matching nothing means the stored ports don't line up with
+        whatever the caller is resolving against, a mismatch the
+        counts alone can't show.
         """
         self._session.stop()
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=10)
         if self._thread is not None:
+            with self._events_lock:
+                stored_ports = [[port, pid] for _ts, port, pid in self._events]
             self.emit("ghostrun_status", "connection_monitor_summary", {
                 "events_received": self._events_received,
                 "events_stored": self._events_stored,
+                "stored_ports": stored_ports,
             })
