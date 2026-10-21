@@ -78,6 +78,31 @@ _KERNEL_NETWORK_KEYWORD_MASK = 0
 _MAX_TRACKED_EVENTS = 10000
 
 
+def _ntohs(value):
+    """
+    swaps the byte order of a 16-bit value.
+
+    network protocols send port numbers in network byte order
+    (big-endian), regardless of the host's own native order. same
+    reason BSD sockets code calls ntohs() on a port straight off the
+    wire.
+
+    etw_session.decode_event_properties doesn't know this: it decodes
+    every TDH_INTYPE_UINT16 field as plain little-endian, correct for
+    ordinary Windows-native fields but wrong for sport/dport
+    specifically, since their byte order comes from what they
+    represent, not from the in-type.
+
+    confirmed live on FlareVM: six undecoded dport values (13568,
+    47873, 13568, 47873, 13568, 20480) swap to 53, 443, 53, 443, 53,
+    80, matching this run's own DNS/HTTPS/HTTP connections exactly,
+    and the matching sport values swap to a run of nearby ephemeral
+    ports, consistent with several connections opened in quick
+    succession.
+    """
+    return ((value & 0xFF) << 8) | ((value >> 8) & 0xFF)
+
+
 class EtwConnectionWatcher:
     """
     event-driven per-process network attribution via the
@@ -155,19 +180,23 @@ class EtwConnectionWatcher:
 
         remote_port is stored alongside but resolve_pid doesn't use
         it. it exists so connection_monitor_summary (see stop()) can
-        show what a stored connection actually went to, e.g. to
-        diagnose GhostRun's own loopback evidence-channel traffic
-        (excluded by --host/--port on NetworkCapture) getting captured
-        here by mistake. read with .get(), not direct indexing: unlike
-        local_port, it isn't load-bearing for resolve_pid, so a props
-        dict that omits it (e.g. a test exercising only the
-        malware-tree filter) shouldn't raise.
+        show what a stored connection actually went to. read with
+        .get(), not direct indexing: unlike local_port, it isn't
+        load-bearing for resolve_pid, so a props dict that omits it
+        (e.g. a test exercising only the malware-tree filter) shouldn't
+        raise.
+
+        both ports are byte-swapped via _ntohs, see that function's
+        own docstring for why decode_event_properties' plain
+        little-endian read is wrong for these two fields.
         """
         pid = props[_PROPERTY_PID]
         if not self.process_monitor.is_descendant(pid, self.process_monitor.root_pid):
             return
-        local_port = props[_PROPERTY_LOCAL_PORT]
+        local_port = _ntohs(props[_PROPERTY_LOCAL_PORT])
         remote_port = props.get(_PROPERTY_REMOTE_PORT)
+        if remote_port is not None:
+            remote_port = _ntohs(remote_port)
         timestamp = time.time()
         with self._events_lock:
             self._events.append((timestamp, local_port, pid, remote_port))
