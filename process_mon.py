@@ -157,7 +157,7 @@ class ProcessMonitor:
             session_name="GhostRunProcessMonitor",
             provider_guid=_KERNEL_PROCESS_PROVIDER_GUID,
             keyword_mask=_WINEVENT_KEYWORD_PROCESS,
-            trace_level=etw_session._TRACE_LEVEL_INFORMATION,
+            trace_level=etw_session.TRACE_LEVEL_INFORMATION,
             event_record_callback=self._etw_event_record_callback,
         )
 

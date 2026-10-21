@@ -49,8 +49,9 @@ from ctypes import wintypes
 
 class GUID(ctypes.Structure):
     # standard 16-byte win32 guid layout from guiddef.h, unchanged since
-    # win32's start. same convention wfp_connection_watcher.py's own _GUID
-    # uses (ctypes.wintypes has no guid type here).
+    # win32's start. same convention the former wfp_connection_watcher.py's
+    # own _GUID used, removed in commit a82e73c (ctypes.wintypes has no
+    # guid type here).
     # public (no leading underscore): every etw consumer module builds its
     # own provider guid with this type.
     _fields_ = [
@@ -70,7 +71,7 @@ _PROCESS_TRACE_MODE_REAL_TIME = 0x00000100
 _PROCESS_TRACE_MODE_EVENT_RECORD = 0x10000000
 _EVENT_TRACE_CONTROL_STOP = 1
 _EVENT_CONTROL_CODE_ENABLE_PROVIDER = 1
-_TRACE_LEVEL_INFORMATION = 4
+TRACE_LEVEL_INFORMATION = 4
 _ERROR_INSUFFICIENT_BUFFER = 122
 # ERROR_ALREADY_EXISTS = 183 (0xb7), see learn.microsoft.com's system
 # error codes page (fetched 2026-10-16). StartTraceW's own docs say
@@ -526,9 +527,10 @@ def _tdh_string_at(info_buf, offset):
     via ctypes.wstring_at: wstring_at uses the host's native wchar_t
     size (2 bytes on windows, 4 on linux/glibc), which silently
     misreads this buffer on a non-windows host (a test caught this
-    before the fix). windows api string data is always utf-16le
-    regardless of host, so decoding explicitly avoids the trap. same
-    issue wfp_connection_watcher.py's _decode_app_id handles.
+    before the fix). same issue the former wfp_connection_watcher.py's
+    _decode_app_id handled, removed in commit a82e73c. windows api
+    string data is always utf-16le regardless of host, so decoding
+    explicitly avoids the trap everywhere this module runs.
     """
     if not offset:
         return None
@@ -704,7 +706,7 @@ def decode_event_properties(event_record_ptr):
     return result
 
 
-def _new_trace_properties_buffer(session_name):
+def _new_trace_properties_buffer():
     """
     a zeroed EVENT_TRACE_PROPERTIES buffer with room for the session
     name after it, set up the way both StartTraceW and a ControlTraceW
@@ -716,13 +718,11 @@ def _new_trace_properties_buffer(session_name):
     generates a new session guid). callers set LogFileMode themselves
     when starting a session.
 
-    session_name is a parameter, not a module constant, since
-    etwsession carries its own per-instance session name.
-    _MAXIMUM_SESSION_NAME is a fixed cap on the buffer's spare room,
-    not the actual name's length, so the buffer's byte layout doesn't
-    vary by session_name. the parameter keeps this function from
-    implicitly depending on one hardcoded session, matching
-    EtwSession.start()/stop()'s own per-instance session_name.
+    takes no session_name: _MAXIMUM_SESSION_NAME is a fixed cap on the
+    buffer's spare room regardless of which session this is for, and
+    the actual name is never written into this buffer at all. it
+    reaches the native calls directly as StartTraceW/ControlTraceW's
+    own `name` argument (self.session_name), not through this one.
     """
     buffer_size = ctypes.sizeof(_EVENT_TRACE_PROPERTIES) + (_MAXIMUM_SESSION_NAME + _MAX_PATH) * 2
     props_buf = ctypes.create_string_buffer(buffer_size)
@@ -789,7 +789,7 @@ class EtwSession:
         ]
         advapi32.ControlTraceW.restype = ctypes.c_ulong
 
-        props_buf = _new_trace_properties_buffer(self.session_name)
+        props_buf = _new_trace_properties_buffer()
         props = ctypes.cast(props_buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES)).contents
         props.LogFileMode = _EVENT_TRACE_REAL_TIME_MODE
 
@@ -812,11 +812,11 @@ class EtwSession:
             # retry once. a second ERROR_ALREADY_EXISTS (someone else restarted it
             # meanwhile, or the stop silently failed) falls through to the normal
             # failure path instead of looping.
-            stale_props_buf = _new_trace_properties_buffer(self.session_name)
+            stale_props_buf = _new_trace_properties_buffer()
             advapi32.ControlTraceW(
                 0, self.session_name, ctypes.cast(stale_props_buf, ctypes.c_void_p), _EVENT_TRACE_CONTROL_STOP,
             )
-            props_buf = _new_trace_properties_buffer(self.session_name)
+            props_buf = _new_trace_properties_buffer()
             props = ctypes.cast(props_buf, ctypes.POINTER(_EVENT_TRACE_PROPERTIES)).contents
             props.LogFileMode = _EVENT_TRACE_REAL_TIME_MODE
             session_handle = ctypes.c_uint64(0)
