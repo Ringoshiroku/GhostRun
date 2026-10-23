@@ -73,7 +73,14 @@ class NetworkFindingEngine:
         # missing key, a future third value, counts as "unknown".
         attribution_confidence = "resolved" if data.get("pid_attribution") == _RESOLVED_PID_NOTE else "unknown"
 
-        key = (raddr, hostname, data.get("url"))
+        # an ids_alert's own signature is part of the dedup identity: two
+        # distinct real Suricata signatures firing on the same connection
+        # (e.g. two different rules both matching one DNS lookup) are each
+        # independently meaningful and must not collapse into one finding
+        # just because dest/hostname/url match. every other event type has
+        # no signature field, so this is a no-op (None) for them, same key
+        # as before.
+        key = (raddr, hostname, data.get("url"), data.get("signature"))
         # dedup keeps whichever event arrives first, but attribution can
         # differ per event since resolution is per-connection: an early
         # "unknown" can later get a "resolved" for the same destination.
@@ -82,7 +89,7 @@ class NetworkFindingEngine:
         if key in self._seen:
             self._upgrade_attribution(
                 attribution_confidence,
-                lambda f: (f.get("raddr"), f.get("hostname"), f.get("url")) == key,
+                lambda f: (f.get("raddr"), f.get("hostname"), f.get("url"), f.get("signature")) == key,
             )
             return
         # flow_summary has no hostname/url, so it won't match the _seen key
