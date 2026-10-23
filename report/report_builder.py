@@ -170,7 +170,7 @@ class MarkdownReportBuilder:
         """
         if not isinstance(data, dict):
             return data
-        return ", ".join(f"{k}: {v}" for k, v in data.items())
+        return ", ".join(f"{k}: {v}" for k, v in data.items() if v is not None)
 
     def fmt_registry_value(self, val):
         """registry_snapshot.py's diff_registry stores a REG_BINARY
