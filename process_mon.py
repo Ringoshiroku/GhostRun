@@ -61,19 +61,175 @@ def _build_process_create_evidence(pid, ppid, name, cmdline_raw, image_path, cre
     }
 
 
+# =============================================================================
+# best-effort live command-line recovery via a direct PEB read.
+#
+# confirmed against the repnz manifest (raw.githubusercontent.com/repnz/
+# etw-providers-docs, Manifests-Win10-18990/Microsoft-Windows-Kernel-Process.xml,
+# fetched 2026-10-23): no ProcessStart template version this provider defines
+# (v0 ProcessStartArgs through v3 ProcessRundownArgs_V1, the version a live
+# session actually receives) carries a CommandLine field. confirmed live
+# (run32.jsonl): a real cmd.exe /c exit child and a harness self-
+# reinvocation both got cmdline: [] from the etw path alone, even though
+# each had a genuine command line (confirmed against the native test
+# harness's own C source). the separate psutil-based seeding poll
+# (_seed_existing_processes) can recover a cmdline, but only for a process
+# still alive the next time it polls, which a process that lives a few
+# milliseconds (both cases above: ~2.5ms) never is.
+#
+# this reads the real command line straight from the target process's own
+# PEB instead, the same technique WinDbg/Process Hacker/forensic tooling
+# use, attempted the instant ETW's own ProcessStart event fires (the
+# earliest possible moment, giving even a short-lived process its best
+# chance of still being alive long enough to read). still a race: nothing
+# can read a process that has already exited by the time this runs.
+#
+# structure/offset citations (all fetched 2026-10-23):
+# - NtQueryInformationProcess signature, ProcessBasicInformation=0, and
+#   PROCESS_BASIC_INFORMATION's exact field order/types: Microsoft's own
+#   learn.microsoft.com/windows/win32/api/winternl/nf-winternl-ntqueryinformationprocess.
+# - UNICODE_STRING's exact field order/types: Microsoft's own
+#   learn.microsoft.com/windows/win32/api/ntdef/ns-ntdef-_unicode_string.
+# - PROCESS_QUERY_INFORMATION=0x0400, PROCESS_VM_READ=0x0010: Microsoft's own
+#   learn.microsoft.com/windows/win32/procthread/process-security-and-access-rights.
+# - PEB.ProcessParameters offset 0x20 (x64) and
+#   RTL_USER_PROCESS_PARAMETERS.CommandLine offset 0x70 (x64): both
+#   undocumented by Microsoft (explicitly subject to change per the
+#   NtQueryInformationProcess page above), verified instead against Geoff
+#   Chappell's long-standing, widely-cited Windows internals reference
+#   (geoffchappell.com/studies/windows/km/ntoskrnl/inc/api/pebteb/{peb,
+#   rtl_user_process_parameters}). x64-only, matching this module's own
+#   64-bit-only target (see etw_session.py's INVALID_PROCESSTRACE_HANDLE note).
+# =============================================================================
+
+_PROCESS_QUERY_INFORMATION = 0x0400
+_PROCESS_VM_READ = 0x0010
+_PROCESS_BASIC_INFORMATION_CLASS = 0  # ProcessBasicInformation
+
+
+class _PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    # AffinityMask/BasePriority/UniqueProcessId/InheritedFromUniqueProcessId
+    # are never read here; kept so ctypes computes PebBaseAddress's real
+    # x64 offset (an NTSTATUS plus alignment padding) itself, instead of a
+    # hand-counted one.
+    _fields_ = [
+        ("ExitStatus", ctypes.c_long),
+        ("PebBaseAddress", ctypes.c_void_p),
+        ("AffinityMask", ctypes.c_void_p),
+        ("BasePriority", ctypes.c_long),
+        ("UniqueProcessId", ctypes.c_void_p),
+        ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+    ]
+
+
+class _PEB_PARTIAL(ctypes.Structure):
+    # the real PEB has many more (mostly undocumented) fields before this
+    # one; only ProcessParameters is ever needed here, so the rest is an
+    # untyped reserved blob sized to its offset, not spelled out field by
+    # field.
+    _fields_ = [
+        ("_reserved", ctypes.c_byte * 0x20),
+        ("ProcessParameters", ctypes.c_void_p),
+    ]
+
+
+class _UNICODE_STRING(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.c_ushort),
+        ("MaximumLength", ctypes.c_ushort),
+        ("Buffer", ctypes.c_void_p),
+    ]
+
+
+class _RTL_USER_PROCESS_PARAMETERS_PARTIAL(ctypes.Structure):
+    # same partial-structure approach as _PEB_PARTIAL: only CommandLine is
+    # ever read.
+    _fields_ = [
+        ("_reserved", ctypes.c_byte * 0x70),
+        ("CommandLine", _UNICODE_STRING),
+    ]
+
+
+def _read_remote_cmdline(pid):
+    """
+    best-effort: returns the target process's real command line as one
+    string (_normalize_cmdline already knows how to split a plain string,
+    the same as a wmi-sourced cmdline), or None on literally any failure
+    (process already gone, access denied, a PEB that isn't fully set up
+    yet, ctypes.windll not existing at all on a non-windows dev machine, ...).
+    must never raise: this runs on etw's own callback thread, same
+    constraint _etw_event_record_callback's own docstring already states.
+    """
+    h_process = None
+    try:
+        kernel32 = ctypes.windll.kernel32
+        ntdll = ctypes.windll.ntdll
+        kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        ntdll.NtQueryInformationProcess.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+        ]
+        ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+        kernel32.ReadProcessMemory.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p,
+        ]
+        kernel32.ReadProcessMemory.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+
+        h_process = kernel32.OpenProcess(_PROCESS_QUERY_INFORMATION | _PROCESS_VM_READ, False, pid)
+        if not h_process:
+            return None
+
+        pbi = _PROCESS_BASIC_INFORMATION()
+        status = ntdll.NtQueryInformationProcess(
+            h_process, _PROCESS_BASIC_INFORMATION_CLASS, ctypes.byref(pbi), ctypes.sizeof(pbi), None,
+        )
+        if status != 0 or not pbi.PebBaseAddress:
+            return None
+
+        peb = _PEB_PARTIAL()
+        if not kernel32.ReadProcessMemory(h_process, pbi.PebBaseAddress, ctypes.byref(peb), ctypes.sizeof(peb), None):
+            return None
+        if not peb.ProcessParameters:
+            return None
+
+        params = _RTL_USER_PROCESS_PARAMETERS_PARTIAL()
+        if not kernel32.ReadProcessMemory(
+            h_process, peb.ProcessParameters, ctypes.byref(params), ctypes.sizeof(params), None
+        ):
+            return None
+
+        length = params.CommandLine.Length
+        buffer_ptr = params.CommandLine.Buffer
+        if not buffer_ptr or length <= 0:
+            return None
+
+        raw = ctypes.create_string_buffer(length)
+        if not kernel32.ReadProcessMemory(h_process, buffer_ptr, raw, length, None):
+            return None
+
+        return raw.raw.decode("utf-16-le", errors="replace")
+    except Exception:
+        return None
+    finally:
+        if h_process:
+            ctypes.windll.kernel32.CloseHandle(h_process)
+
+
 def _etw_process_start_to_evidence(pid, ppid, name, image_path, create_time):
     """
     builds the same evidence shape _build_process_create_evidence
     already produces from wmi, but from an etw-decoded processstart event.
-    ProcessStartArgs (template v0) carries no CommandLine field like
-    wmi's win32_process did, so cmdline is always [] here, matching
-    _normalize_cmdline's contract for an absent cmdline_raw.
-    if a later live test needs CommandLine and a newer template version
-    still doesn't have it, that's a new finding to raise then, not a
-    guess to make now.
+    no ProcessStart template version this provider defines carries a
+    CommandLine field (see _read_remote_cmdline's module comment above
+    for the citation), so cmdline comes from a best-effort live PEB read
+    instead, attempted the moment this event fires. still [] when that
+    read itself fails, matching _normalize_cmdline's contract for an
+    absent cmdline_raw.
     """
     return _build_process_create_evidence(
-        pid=pid, ppid=ppid, name=name, cmdline_raw=None,
+        pid=pid, ppid=ppid, name=name, cmdline_raw=_read_remote_cmdline(pid),
         image_path=image_path, create_time=create_time,
     )
 
