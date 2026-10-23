@@ -8,6 +8,29 @@ from watchdog.observers import Observer
 
 from yara_scan import YaraScanError, match_rules
 
+# the filesystem-watch API (watchdog/ReadDirectoryChangesW) never exposes
+# which process actually wrote a file, unlike network capture's
+# connection-table correlation (see network_watch.py's
+# _PID_ATTRIBUTION_NOTE/_RESOLVED_PID_NOTE). root_pid below is always a
+# capture-wide guess, never a resolved fact, for every monitored root.
+# that's an acceptable, unhedged simplifying assumption for a root scoped
+# to the one analysis user's own profile (TEMP, APPDATA, etc.), where the
+# sample is normally the dominant writer during a short monitoring window.
+# it broke live for WINDOWS_TEMP: a real run captured an OS-created-then-
+# deleted OProcSessId.dat (hash of an empty file) and a diagnostic .log,
+# neither written by the sample, reported as a confident Dropped File IOC
+# just because they landed under a root the sample's PID happened to be
+# watching. these roots are written to by system/service-level processes
+# regardless of which user is logged in, so file events there carry an
+# explicit attribution_confidence hedge instead.
+_SHARED_SYSTEM_ROOTS = {"WINDOWS_TEMP", "PROGRAMDATA"}
+
+
+def _attribution_fields(root):
+    if root in _SHARED_SYSTEM_ROOTS:
+        return {"attribution_confidence": "unknown"}
+    return {}
+
 
 def hash_file(path, size_cap_bytes=100_000_000):
     try:
@@ -97,8 +120,10 @@ class _Handler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
             return
+        root = self.watcher._root_for_path(event.src_path)
         self.emit("filesystem_behavior", "file_created", {
-            "root": self.watcher._root_for_path(event.src_path), "path": event.src_path, "pid": self.root_pid,
+            "root": root, "path": event.src_path, "pid": self.root_pid,
+            **_attribution_fields(root),
         })
         self.hasher.touch(event.src_path)
 
@@ -213,10 +238,12 @@ class FilesystemWatcher:
         return best_root
 
     def _on_hash_settled(self, path, digest):
+        root = self._root_for_path(path)
         if digest is not None:
             self.emit("filesystem_behavior", "file_content_hashed", {
                 "path": path, "sha256": digest, "pid": self.root_pid,
-                "root": self._root_for_path(path),
+                "root": root,
+                **_attribution_fields(root),
             })
             self._scan_and_emit_yara_matches(path)
             return
@@ -236,7 +263,8 @@ class FilesystemWatcher:
         if over_cap:
             self.emit("filesystem_behavior", "file_content_hashed", {
                 "path": path, "sha256": None, "reason": "size_cap_exceeded",
-                "pid": self.root_pid, "root": self._root_for_path(path),
+                "pid": self.root_pid, "root": root,
+                **_attribution_fields(root),
             })
 
     def _scan_and_emit_yara_matches(self, path):

@@ -117,6 +117,24 @@ class TimelineBuilder:
                     if path and not self.is_system_noise(path):
                         sha256 = hashes_by_path.get(path)
                         value = f"{path} (sha256: {sha256})" if sha256 else path
+                        # filesystem_watch.py can't resolve which process
+                        # actually wrote a file (no equivalent to network's
+                        # connection-table correlation), so a shared system
+                        # root (WINDOWS_TEMP, PROGRAMDATA) only gets a
+                        # capture-wide guess, never a resolved fact.
+                        # confirmed live: an OS-created-then-deleted
+                        # OProcSessId.dat got reported as a confident
+                        # malware-dropped IOC purely because it landed
+                        # under a root the sample's PID happened to be
+                        # watching. caveat it the same way an unresolved
+                        # network finding is caveated, instead of
+                        # silently asserting attribution confidence has
+                        # no room to downgrade (already the "low" floor).
+                        if data.get("attribution_confidence") == "unknown":
+                            value += (
+                                " [unresolved attribution: observed during the run, "
+                                "not confirmed to a specific malware process]"
+                            )
                         self._add_ioc("file", value, confidence="low", source="heuristic")
 
                 if event == "mass_extension_change":
