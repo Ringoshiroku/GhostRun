@@ -161,6 +161,17 @@ class MarkdownReportBuilder:
 
         return None
 
+    def fmt_finding_data(self, data):
+        """Key Findings interpolated a timeline event's raw data dict
+        straight into the bullet, rendering literal python dict syntax
+        ("{'pid': 1916, 'family': 'DarkComet', ...}") in the first section
+        an analyst reads after the executive summary. Render it as a plain
+        key: value list instead; anything that isn't a dict is left as-is.
+        """
+        if not isinstance(data, dict):
+            return data
+        return ", ".join(f"{k}: {v}" for k, v in data.items())
+
     def fmt_registry_value(self, val):
         """registry_snapshot.py's diff_registry stores a REG_BINARY
         before/after as str(bytes) (e.g. "b's;\\x9a!...'"), a leaked Python
@@ -634,7 +645,7 @@ class MarkdownReportBuilder:
             if ev.get("confidence") == "high":
                 lines.append(
                     f"- **{ev.get('event')}** ({ev.get('category')}) — "
-                    f"{ev.get('data')}"
+                    f"{self.fmt_finding_data(ev.get('data'))}"
                 )
         lines.append("")
 
