@@ -455,13 +455,12 @@ class MarkdownReportBuilder:
                 name = data.get("name", "").lower()
                 pid = data.get("pid")
                 cmd = " ".join(data.get("cmdline", [])).lower()
-                
+
                 self.behaviors["Process"].append(
                     f"Process created: {name} (PID {pid})"
                 )
-                # Soft IOC
-                if data.get("name"):
-                    self.soft_iocs["Executed Malware"].add(data["name"])
+                # Executed Malware is now populated from ioc_generated
+                # below, not re-derived here.
 
                 if name == "cmd.exe" and "del" in cmd:
                     self.behaviors["Process"].append(
@@ -477,46 +476,28 @@ class MarkdownReportBuilder:
                     self.behaviors["Filesystem"].append(
                         f"Mass file extension change to {data.get('to_ext')}"
                     )
-                    self.hard_iocs["Ransomware Extension"].add(data.get("to_ext"))
+                    # Ransomware Extension is now populated from
+                    # ioc_generated below, not re-derived here.
 
                 if evt == "file_created":
+                    # Dropped File / Ransom Note are now populated from
+                    # ioc_generated below; this still needs to sort a
+                    # noise path into Environmental, which ioc_generated
+                    # doesn't track.
                     p = data.get("path")
-                    if p:
-                        if is_noise(p):
-                            self.environmental.add(p)
-                        else:
-                            if p.lower().endswith((".exe", ".dll", ".ps1")):
-                                self.soft_iocs["Dropped File"].add(p)
+                    if p and is_noise(p):
+                        self.environmental.add(p)
 
-                            # token-based on the basename, not a raw substring check
-                            # against the whole path. a plain "read" in p.lower() false-
-                            # positives on ordinary filenames like
-                            # api-ms-win-core-proces[read]s-l1-1-0.dll ("threads" contains
-                            # "read"). same fix in timeline_builder.py.
-                            fname = os.path.basename(p).lower()
-                            tokens = re.split(r"[^a-z0-9]+", fname)
-                            if any(t.startswith(("read", "decrypt", "recover")) for t in tokens):
-                                self.soft_iocs["Ransom Note"].add(p)
-
-                if evt == "yara_match":
-                    p = data.get("path")
-                    rule = data.get("rule", "?")
-                    # a match inside the sample's own PyInstaller onefile
-                    # extraction dir (_MEI<pid>) is the sample's own
-                    # legitimately-bundled runtime DLLs, not something it
-                    # dropped -- same noise this file already filters for
-                    # file_created, above.
-                    if p and not is_noise(p):
-                        self.soft_iocs["YARA Match"].add(f"{rule} -> {p}")
+                # yara_match's Soft IOC is now populated from
+                # ioc_generated below, not re-derived here.
 
             ## registry
             if cat in ("registry_behavior", "registry_raw"):
                 self.state_changes["registry"].append(ev)            
 
-            if cat == "registry_behavior":
-                key = data.get("key_path")
-                if key:
-                    self.hard_iocs["Registry Key"].add(key)
+            # Registry Key is now populated from ioc_generated below,
+            # not re-derived here (it used to read "key_path", a field
+            # no production code emits, so this never actually worked).
 
             if cat == "registry_raw":
                 key = data.get("key")
@@ -530,6 +511,60 @@ class MarkdownReportBuilder:
                     self.behaviors["Registry"].append(
                         f"Stored Bitcoin wallet address in registry ({key})"
                     )
+
+        self._apply_generated_iocs()
+
+    # ioc_generated is the one source of truth for "what does this
+    # evidence mean": ghostrun.py already runs TimelineBuilder.extract_iocs()
+    # over the exact same evidence and streams the result once per run.
+    # re-deriving the same analysis here, separately, is how the
+    # location/key_path bug above went unnoticed: it was already found
+    # and fixed in timeline_builder.py, but this file's own copy never
+    # got the same fix, because nothing ever ran it regularly enough to
+    # notice it was broken. category/event-shaped findings (process
+    # creation, network activity) stay derived from raw evidence above,
+    # since those are narrative, not indicators; only the IOC buckets
+    # move here. process_terminated is a narrative fact (confirms the
+    # kill-tree safety net tore the process down), not an indicator, so
+    # it renders as a Process Behavior line instead of an IOC.
+    _IOC_BUCKET_MAP = {
+        "file": ("soft", "Dropped File"),
+        "Ransom Note": ("soft", "Ransom Note"),
+        "Ransomware Extension": ("hard", "Ransomware Extension"),
+        "registry": ("hard", "Registry Key"),
+        "suspicious_persistence": ("soft", "Suspicious Persistence"),
+        "Executed Malware": ("soft", "Executed Malware"),
+        "Execution Command": ("soft", "Execution Command"),
+        "mutex_family": ("soft", "Mutex Family"),
+        "yara_match": ("soft", "YARA Match"),
+        "network": ("hard", "Static Network Indicator"),
+    }
+
+    def _apply_generated_iocs(self):
+        iocs = None
+        for ev in self.evidence:
+            if ev.get("category") == "analysis" and ev.get("event") == "ioc_generated":
+                iocs = ev.get("data") or {}
+        if not iocs:
+            return
+
+        for ioc_category, entries in iocs.items():
+            if ioc_category == "process_terminated":
+                for entry in entries:
+                    value = entry.get("value")
+                    if value:
+                        self.behaviors["Process"].append(f"Process terminated: {value}")
+                continue
+
+            bucket = self._IOC_BUCKET_MAP.get(ioc_category)
+            if bucket is None:
+                continue
+            kind, label = bucket
+            target = self.soft_iocs if kind == "soft" else self.hard_iocs
+            for entry in entries:
+                value = entry.get("value")
+                if value:
+                    target[label].add(value)
 
     # --------------------------------------------------
     # RENDER MARKDOWN
