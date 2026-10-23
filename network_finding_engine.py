@@ -28,6 +28,23 @@ def _is_known_benign(hostname):
     return any(sig in h for sig in KNOWN_BENIGN_DOMAINS)
 
 
+def _format_raddr(dest_ip, dest_port):
+    # an ipv6 address already uses colons as its own separator, so a bare
+    # f"{ip}:{port}" join is ambiguous/malformed -- confirmed live, a
+    # real Suricata flow (dest_ip ff02:0000:0000:0000:0000:0000:0001:0003,
+    # a valid 8-group address, port 5355) produced a 9-group string that
+    # isn't a valid ipv6 address at all. bracket it, same convention
+    # every other tool uses (RFC 3986, netstat, browsers). a colon is
+    # never valid in an ipv4 address or a hostname, so its presence
+    # alone is enough to tell the two apart here, no need for the
+    # ipaddress module's stricter (and slower) validation.
+    if not dest_ip or not dest_port:
+        return dest_ip
+    if ":" in dest_ip:
+        return f"[{dest_ip}]:{dest_port}"
+    return f"{dest_ip}:{dest_port}"
+
+
 class NetworkFindingEngine:
     def __init__(self, root_pid, process_monitor):
         self.root_pid = root_pid
@@ -62,7 +79,7 @@ class NetworkFindingEngine:
 
         dest_ip = data.get("dest_ip")
         dest_port = data.get("dest_port")
-        raddr = f"{dest_ip}:{dest_port}" if dest_ip and dest_port else dest_ip
+        raddr = _format_raddr(dest_ip, dest_port)
         hostname = data.get("sni") or data.get("hostname") or data.get("query_name")
 
         if _is_known_benign(hostname):
