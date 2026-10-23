@@ -693,17 +693,6 @@ class MarkdownReportBuilder:
         lines.append(self.render_wallpaper_section())
         lines.append("")
 
-        # IOC Section
-        lines.append("## Indicators of Compromise (IOCs)\n")
-        if not self.iocs:
-            lines.append("_No high-confidence IOCs identified._\n")
-        else:
-            for ioc_type, values in self.iocs.items():
-                lines.append(f"### {ioc_type}")
-                for v in sorted(values):
-                    lines.append(f"- `{v}`")
-                lines.append("")
-        
         # Behavioral Section
         lines.append("## Behavioral Findings\n")
         for section, items in self.behaviors.items():
