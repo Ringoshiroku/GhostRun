@@ -1,5 +1,6 @@
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import os
+import threading
 from urllib.parse import unquote
 import argparse
 import json
@@ -9,6 +10,12 @@ HOST = "0.0.0.0"
 #PORT = 9001
 
 os.makedirs(BASE_DIR, exist_ok=True)
+
+# every event in a case now streams to one shared <case_id>/evidence.jsonl
+# path (see sender_http.py), not a unique path per event. ThreadingHTTPServer
+# hands each PUT to its own thread, so without this, two concurrent writes
+# to that same path could interleave mid-line and corrupt the file.
+_EVIDENCE_WRITE_LOCK = threading.Lock()
 
 
 class GhostRunPUTHandler(SimpleHTTPRequestHandler):
@@ -56,9 +63,10 @@ class GhostRunPUTHandler(SimpleHTTPRequestHandler):
 
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-        with open(full_path, "ab") as f:
-            f.write(raw)
-            f.write(b"\n")
+        with _EVIDENCE_WRITE_LOCK:
+            with open(full_path, "ab") as f:
+                f.write(raw)
+                f.write(b"\n")
 
         self.send_response(201)
         self.end_headers()

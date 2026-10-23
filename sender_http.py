@@ -1,5 +1,4 @@
 import http.client
-import time
 import json
 
 
@@ -11,8 +10,12 @@ class PutEvidenceSender:
         self.timeout = timeout
 
     def send(self, evidence):
-        ts = int(time.time() * 1000)
-        path = f"/{self.case_id}/{ts}.json"
+        # one shared, append-only path per case, not a unique
+        # <ts_ms>.json path per event: a millisecond-timestamp filename
+        # can collide under a burst of events, and the receiver's
+        # append-mode write would then merge two events' raw JSON into
+        # one invalid blob instead of creating a second file.
+        path = f"/{self.case_id}/evidence.jsonl"
 
         body = json.dumps(evidence, ensure_ascii=False).encode("utf-8")
 

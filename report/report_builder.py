@@ -369,17 +369,25 @@ class MarkdownReportBuilder:
     # LOAD EVIDENCE
     # --------------------------------------------------
     def load_evidence(self):
-        for fname in sorted(os.listdir(self.case_dir)):
-            if not fname.endswith(".json"):
-                continue
+        # one shared, append-only evidence.jsonl per case now (see
+        # receiver_http.py/sender_http.py), not a directory of individual
+        # per-event .json files. a malformed line (e.g. truncated by a
+        # crash mid-write) is skipped without losing every line after it,
+        # unlike the old per-file loader where one bad file just vanished
+        # silently on its own.
+        jsonl_path = os.path.join(self.case_dir, "evidence.jsonl")
+        if not os.path.exists(jsonl_path):
+            return
 
-            fpath = os.path.join(self.case_dir, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    ev = json.load(f)
-                    self.evidence.append(ev)
-            except Exception:
-                continue
+        with open(jsonl_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    self.evidence.append(json.loads(line))
+                except Exception:
+                    continue
 
     # --------------------------------------------------
     # BUILD TIMELINE
@@ -489,6 +497,17 @@ class MarkdownReportBuilder:
                             tokens = re.split(r"[^a-z0-9]+", fname)
                             if any(t.startswith(("read", "decrypt", "recover")) for t in tokens):
                                 self.soft_iocs["Ransom Note"].add(p)
+
+                if evt == "yara_match":
+                    p = data.get("path")
+                    rule = data.get("rule", "?")
+                    # a match inside the sample's own PyInstaller onefile
+                    # extraction dir (_MEI<pid>) is the sample's own
+                    # legitimately-bundled runtime DLLs, not something it
+                    # dropped -- same noise this file already filters for
+                    # file_created, above.
+                    if p and not is_noise(p):
+                        self.soft_iocs["YARA Match"].add(f"{rule} -> {p}")
 
             ## registry
             if cat in ("registry_behavior", "registry_raw"):
