@@ -50,6 +50,21 @@ class TimelineBuilder:
         self.iocs[category].append({"value": value, "confidence": confidence, "source": source})
 
     def extract_iocs(self):
+        # a hash is only useful attached to something already worth
+        # looking at, cross-referenced by path, not dumped wholesale (a
+        # real run hashes dozens of the sample's own runtime noise files
+        # too). built as its own pass since the hash event for a path
+        # can arrive before or after the event that flags that same
+        # path; a single forward pass couldn't look an earlier flag's
+        # hash up if the hash hadn't been seen yet.
+        hashes_by_path = {}
+        for ev in self.evidences:
+            if ev.get("category") == "filesystem_behavior" and ev.get("event") == "file_content_hashed":
+                data = ev.get("data", {})
+                path, sha256 = data.get("path"), data.get("sha256")
+                if path and sha256:
+                    hashes_by_path[path] = sha256
+
         for ev in self.evidences:
             category = ev.get("category")
             event = ev.get("event")
@@ -71,12 +86,38 @@ class TimelineBuilder:
                 if key:
                     self._add_ioc("registry", key, confidence="medium", source="registry_persistence")
 
+            # ---- persistence_detector.py's own, separate signal: an
+            # execution reference in the registry with no matching
+            # process execution. distinct from registry_behavior above
+            # (a different detector, a different question answered).
+            if category == "persistence" and event == "suspicious_registry_persistence_artifact":
+                path, location = data.get("path"), data.get("location")
+                if path and location:
+                    self._add_ioc(
+                        "suspicious_persistence", f"{path} -> {location}",
+                        confidence="medium", source="persistence_detector",
+                    )
+
+            # ---- process terminated: GhostRun's own kill-tree safety
+            # net actually tearing down the sample's process tree is
+            # real forensic context, not just an internal cleanup detail.
+            if category == "process" and event == "process_terminate":
+                name, pid = data.get("name"), data.get("pid")
+                if name:
+                    value = f"{name} (PID {pid})" if pid else name
+                    self._add_ioc("process_terminated", value, confidence="low", source="process_lifecycle")
+
             if category == "filesystem_behavior":
                 if event == "file_created":
                     path = data.get("path")
+                    # a real dropper can use any extension; a whitelist
+                    # of .exe/.dll/.ps1 misses exactly the files worth
+                    # flagging (confirmed live against a .bin payload).
+                    # the system-noise filter alone is the real bar.
                     if path and not self.is_system_noise(path):
-                        if path.lower().endswith((".exe", ".dll", ".ps1")):
-                            self._add_ioc("file", path, confidence="low", source="heuristic")
+                        sha256 = hashes_by_path.get(path)
+                        value = f"{path} (sha256: {sha256})" if sha256 else path
+                        self._add_ioc("file", value, confidence="low", source="heuristic")
 
                 if event == "mass_extension_change":
                     ext = data.get("to_ext")
@@ -86,8 +127,20 @@ class TimelineBuilder:
                 if event == "yara_match":
                     rule = data.get("rule")
                     path = data.get("path")
-                    if rule:
-                        value = f"{rule} ({path})" if path else rule
+                    # same noise filter file_created already uses: a
+                    # match inside the sample's own PyInstaller onefile
+                    # extraction dir (_MEI<pid>) is its own legitimately-
+                    # bundled runtime DLLs, not something it dropped
+                    # (confirmed live: 125 of 126 real matches in one
+                    # run were exactly this).
+                    if rule and not (path and self.is_system_noise(path)):
+                        sha256 = hashes_by_path.get(path) if path else None
+                        if path and sha256:
+                            value = f"{rule} ({path}, sha256: {sha256})"
+                        elif path:
+                            value = f"{rule} ({path})"
+                        else:
+                            value = rule
                         self._add_ioc("yara_match", value, confidence="high", source="yara_scan")
 
             # ---- Executed sample (Soft IOC)
