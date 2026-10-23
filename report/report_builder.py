@@ -161,6 +161,19 @@ class MarkdownReportBuilder:
 
         return None
 
+    def fmt_registry_value(self, val):
+        """registry_snapshot.py's diff_registry stores a REG_BINARY
+        before/after as str(bytes) (e.g. "b's;\\x9a!...'"), a leaked Python
+        repr, confirmed live in report_run28.md's BAM key entry. Render it
+        as plain hex instead, same convention sha256 hashes already use
+        elsewhere in this report; anything that doesn't round-trip through
+        normalize_blob (a normal REG_SZ/REG_DWORD string) is left as-is.
+        """
+        blob = self.normalize_blob(val)
+        if blob is not None:
+            return blob.hex()
+        return val
+
     def render_wallpaper_section(self):
         lines = []
         lines.append("### Desktop Wallpaper Changes\n")
@@ -679,8 +692,8 @@ class MarkdownReportBuilder:
                 for m in reg_summary["values_modified"]:
                     lines.append(
                         f"  - `{m['key']}\\{m['value']}`\n"
-                        f"    - Before: `{m['before']}`\n"
-                        f"    - After : `{m['after']}`"
+                        f"    - Before: `{self.fmt_registry_value(m['before'])}`\n"
+                        f"    - After : `{self.fmt_registry_value(m['after'])}`"
                     )
 
         lines.append("")
