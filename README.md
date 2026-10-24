@@ -18,6 +18,10 @@ may still make real network connections if your VM allows it. GhostRun
 does not block those connections. It only watches and reports on
 them.
 
+## Credits
+
+Original version by Mark Rizal.
+
 ## Requirements
 
 - Windows 10 or 11, run as Administrator. GhostRun uses Windows' own
