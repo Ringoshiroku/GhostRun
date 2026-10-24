@@ -1,5 +1,20 @@
 __pycache__/
 *.pyc
 cases/
+run*.jsonl
 .worktrees/
 .superpowers/
+
+# dev/test tooling, not part of the shipped tool
+tests/
+reasoning/
+STATUS.md
+ghostrun_v2.py
+ghostrun_v3.py
+ghostrun_test_harness.py
+ghostrun_native_harness.c
+ghostrun_native_harness.exe
+flarevm-sync-run.ps1
+ss_*.PNG
+report/report_run*.md
+report/report_scvhost.md
