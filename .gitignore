@@ -9,6 +9,7 @@ run*.jsonl
 tests/
 reasoning/
 STATUS.md
+ARCHITECTURE.md
 ghostrun_v2.py
 ghostrun_v3.py
 ghostrun_test_harness.py
